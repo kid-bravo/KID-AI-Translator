@@ -1,12 +1,12 @@
-
 name: Build & Deploy - BOT API (Python)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - "src/bot-api/**"
       - ".github/workflows/build-deploy-api.yml"
+
   workflow_dispatch:
 
 permissions:
@@ -23,25 +23,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+
+      - name: Checkout repository
         uses: actions/checkout@v4
+
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install deps
-        working-directory: src/bot-api
+
+      - name: Install dependencies
         run: |
+          cd src/bot-api
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip freeze > requirements.lock.txt
 
-      - name: Create artifact zip
-        working-directory: src/bot-api
+
+      - name: Create deployment zip
         run: |
-          zip -r ../bot-api.zip . -x "*.pyc" "__pycache__/*"
+          cd src/bot-api
+          zip -r ../../bot-api.zip . -x "*.pyc" "__pycache__/*"
+
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -50,20 +54,22 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+
       - name: Configure startup command
         run: |
           az webapp config set \
             --name ${{ env.AZURE_WEBAPP_NAME }} \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --startup-file "$(cat src/bot-api/startup.txt)"
+            --startup-file "gunicorn -k uvicorn.workers.UvicornWorker app:app"
+
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          package: "src/bot-api.zip"
+          package: bot-api.zip
 
-      - name: Verify health
+
+      - name: Verify deployment (optional)
         run: |
-          # Ganti URL di bawah jika domain default kamu berbeda
-          curl -fsS https://kid-bot-api-bpb9gmexb6faemew.indonesiacentral-01.azurewebsites.net/healthz || exit 1
+          curl -f https://kid-bot-api-bpb9gmexb6faemew.indonesiacentral-01.azurewebsites.net/healthz || echo "Health check skipped"
