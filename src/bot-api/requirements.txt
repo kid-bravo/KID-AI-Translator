@@ -6,3 +6,5 @@ httpx==0.27.0
 # Bot Framework (versi selaras)
 botbuilder-core==4.14.6
 # botbuilder-schema akan ter-install otomatis oleh botbuilder-core 4.14.6
+
+aiohttp==3.9.3
