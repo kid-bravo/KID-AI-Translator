@@ -1,11 +1,10 @@
 from botbuilder.core import ActivityHandler, TurnContext
-from botbuilder.schema import ChannelAccount
 import os, httpx, uuid
 
 # Menggunakan endpoint global (api.cognitive.microsofttranslator.com)
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
-TRANSLATOR_REGION = os.getenv("TRANSLATOR_REGION", "southeastasia")
-TRANSLATOR_KEY = os.getenv("TRANSLATOR_KEY")
+TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
+TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
 
 class TranslatorBot(ActivityHandler):
@@ -28,17 +27,17 @@ class TranslatorBot(ActivityHandler):
             return
 
         if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
-            await turn_context.send_activity("Translator belum dikonfigurasi.")
+            await turn_context.send_activity("Translator belum dikonfigurasi di server.")
             return
 
-        # Endpoint GLOBAL → path harus /translate?api-version=3.0
+        # ENDPOINT GLOBAL → path: /translate?api-version=3.0
         url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
         if from_lang:
             url += f"&from={from_lang}"
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk endpoint global
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -46,13 +45,14 @@ class TranslatorBot(ActivityHandler):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 res = await client.post(url, json=[{"Text": content}], headers=headers)
-                if res.status_code >= 400:
-                    await turn_context.send_activity(
-                        f"Error Translator {res.status_code}: {res.text}"
-                    )
-                    return
-                data = res.json()
 
+            if res.status_code >= 400:
+                await turn_context.send_activity(
+                    f"Error Translator {res.status_code}: {res.text}"
+                )
+                return
+
+            data = res.json()
             translated = data[0]["translations"][0]["text"]
             await turn_context.send_activity(translated)
 
@@ -60,16 +60,13 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
     def _parse_direction(self, text: str):
-        # Pola: "xx->yy kalimat"
+        # Pola: "xx->yy kalimat". Jika tidak ada, auto-detect source (None), target=en.
         default_to = "en"
         if not text:
             return None, default_to, ""
-
-        first = text.split(" ")[0]
-        if "->" in first and len(text.split(" ")) > 1:
-            parts = first.split("->")
-            if len(parts) == 2:
-                return parts[0].lower(), parts[1].lower(), " ".join(text.split(" ")[1:])
-
-        # Tidak ada arah → auto detect + default target English
+        parts = text.split(" ")
+        first = parts[0]
+        if "->" in first and len(parts) > 1:
+            a, b = first.split("->", 1)
+            return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
