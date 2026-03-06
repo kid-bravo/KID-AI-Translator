@@ -126,4 +126,3 @@ async def messages(request: Request):
 
     await adapter.process_activity(activity, auth_header, aux_turn)
     return Response(status_code=201)
-``
