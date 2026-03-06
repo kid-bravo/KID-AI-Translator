@@ -3,9 +3,35 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import os, uuid, httpx
 from fastapi import Request, Response
-from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings
-from botbuilder.schema import Activity
-from .bot import TranslatorBot  # butuh __init__.py agar import relatif jalan
+BOT_IMPORT_ERROR = None
+BOTBUILDER_AVAILABLE = False
+try:
+    from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings
+    from botbuilder.schema import Activity
+    BOTBUILDER_AVAILABLE = True
+except Exception as e:
+    BOT_IMPORT_ERROR = str(e)
+    BOTBUILDER_AVAILABLE = False
+try:
+    from bot import TranslatorBot
+except Exception as e:
+    TranslatorBot = None
+    if BOT_IMPORT_ERROR is None:
+        BOT_IMPORT_ERROR = f"import bot module failed: {e}"
+MICROSOFT_APP_ID = os.getenv("MicrosoftAppId")
+MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
+adapter = None
+bot = TranslatorBot() if TranslatorBot else None
+def try_create_adapter():
+    if not BOTBUILDER_AVAILABLE:
+        return None
+    app_id = os.getenv("MicrosoftAppId")
+    app_pw = os.getenv("MicrosoftAppPassword")
+    if not app_id or not app_pw:
+        return None
+    settings = BotFrameworkAdapterSettings(app_id=app_id, app_password=app_pw)
+    return BotFrameworkAdapter(settings)
+adapter = try_create_adapter()
 
 app = FastAPI(title="KID AI Translator API")
 
