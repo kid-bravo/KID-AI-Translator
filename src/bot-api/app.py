@@ -127,24 +127,42 @@ async def translate(req: TranslateRequest):
 
 # ===========================================================
 #                    BOT FRAMEWORK ENDPOINT
-# (Aman: jika adapter belum siap, balas 503 tanpa mematikan app)
+#  Aman: untuk tes manual tanpa token → balas 401 (bukan 500)
 # ===========================================================
 @app.post("/api/messages")
 async def messages(request: Request):
+    # 1) Pastikan adapter & bot siap
     if not adapter or not bot:
         raise HTTPException(status_code=503, detail={
             "error": "bot_unavailable",
             "botbuilder_available": BOTBUILDER_AVAILABLE,
             "bot_import_error": BOT_IMPORT_ERROR,
-            "hint": "Pastikan paket botbuilder-core terpasang dan App Settings MicrosoftAppId/MicrosoftAppPassword terisi, lalu restart."
+            "hint": "Pastikan botbuilder-core terpasang dan App Settings MicrosoftAppId/MicrosoftAppPassword terisi, lalu restart."
         })
 
-    body = await request.json()
-    activity = Activity().deserialize(body)
+    # 2) Jika tidak ada token Bearer dari Azure Bot Service → 401 (tes manual)
     auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return Response(status_code=401)
 
-    async def aux_turn(tc):
-        await bot.on_turn(tc)
+    # 3) Validasi body minimal supaya tidak 500 saat payload tidak lengkap
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(status_code=400)
 
-    await adapter.process_activity(activity, auth_header, aux_turn)
-    return Response(status_code=201)
+    try:
+        activity = Activity().deserialize(body)
+    except Exception:
+        return Response(status_code=400)
+
+    # 4) Proses turn bot (dengan token Bearer dari Bot Service)
+    try:
+        async def aux_turn(tc):
+            await bot.on_turn(tc)
+
+        await adapter.process_activity(activity, auth_header, aux_turn)
+        return Response(status_code=201)
+    except Exception as e:
+        print(f"/api/messages error: {e}")  # terlihat di Log stream
+        return Response(status_code=500)
