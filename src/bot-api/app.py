@@ -2,8 +2,23 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os, uuid, httpx
+from fastapi import Request, Response
+from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings
+from botbuilder.schema import Activity
+from .bot import TranslatorBot  # butuh __init__.py agar import relatif jalan
 
 app = FastAPI(title="KID AI Translator API")
+
+MICROSOFT_APP_ID = os.getenv("MicrosoftAppId")
+MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
+
+_adapter_settings = BotFrameworkAdapterSettings(
+    app_id=MICROSOFT_APP_ID,
+    app_password=MICROSOFT_APP_PASSWORD
+)
+adapter = BotFrameworkAdapter(_adapter_settings)
+bot = TranslatorBot()
+
 
 TRANSLATOR_ENDPOINT = os.getenv("TRANSLATOR_ENDPOINT", "").rstrip("/")
 TRANSLATOR_REGION = os.getenv("TRANSLATOR_REGION", "southeastasia")
@@ -43,3 +58,15 @@ async def translate(req: TranslateRequest):
         "detectedLanguage": data[0].get("detectedLanguage"),
         "translations": data[0].get("translations", [])
     }
+
+app.post("/api/messages")
+async def messages(request: Request):
+    body = await request.json()
+    activity = Activity().deserialize(body)
+    auth_header = request.headers.get("Authorization", "")
+
+    async def aux_turn(turn_context):
+        await bot.on_turn(turn_context)
+
+    await adapter.process_activity(activity, auth_header, aux_turn)
+    return Response(status_code=201)
