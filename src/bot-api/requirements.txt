@@ -3,6 +3,6 @@ uvicorn[standard]==0.27.1
 gunicorn==21.2.0
 httpx==0.27.0
 
-botbuilder-core==4.15.0
-botbuilder-schema==4.15.0
-botbuilder-integration-fastapi==4.15.0
+# Bot Framework (pakai core + schema saja, tanpa integration-fastapi)
+botbuilder-core==4.14.6
+botbuilder-schema==4.14
