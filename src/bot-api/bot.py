@@ -73,4 +73,3 @@ class TranslatorBot(ActivityHandler):
 
         # Tidak ada arah → auto detect + default target English
         return None, default_to, text
-``
