@@ -78,7 +78,7 @@ async def translate(req: TranslateRequest):
     if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
         raise HTTPException(status_code=500, detail="translator_not_configured")
 
-    # ✅ PATH BENAR untuk Translator v3 pada custom domain (cognitiveservices)
+    # ✅ PATH BENAR untuk Translator v3 pada custom domain
     url = f"{TRANSLATOR_ENDPOINT}/translator/text/v3.0/translate?api-version=3.0&to={req.to}"
     if req.from_lang:
         url += f"&from={req.from_lang}"
@@ -92,18 +92,24 @@ async def translate(req: TranslateRequest):
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            res = await client.post(url, json=[{"Text": req.text}], headers=headers)
-            if res.status_code >= 400:
-                # bubble up error dari Translator biar kelihatan jelas
-                raise HTTPException(status_code=res.status_code, detail={"translator_error": res.text})
-            data = res.json()
+            r = await client.post(url, json=[{"Text": req.text}], headers=headers)
+
+            # ⬇️ Kunci: kirim status_code & body asli kalau gagal
+            if r.status_code >= 400:
+                raise HTTPException(status_code=r.status_code, detail={
+                    "message": "translator_error",
+                    "status_code": r.status_code,
+                    "body": r.text
+                })
+
+            data = r.json()
+            return {
+                "detectedLanguage": data[0].get("detectedLanguage"),
+                "translations": data[0].get("translations", [])
+            }
+
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"translator_unreachable: {e}")
-
-    return {
-        "detectedLanguage": data[0].get("detectedLanguage"),
-        "translations": data[0].get("translations", [])
-    }
 
 # ====== Endpoint Bot Framework ======
 @app.post("/api/messages")
