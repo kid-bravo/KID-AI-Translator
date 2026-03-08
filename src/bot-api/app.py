@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
 import os, uuid, httpx, logging, traceback
@@ -44,6 +45,22 @@ def try_create_adapter():
     return BotFrameworkAdapter(settings)
 
 adapter = try_create_adapter()
+
+# Tambahkan handler error agar error di pipeline adapter tercatat
+if adapter is not None:
+    async def on_error(turn_context, error: Exception):
+        # Log ke Log stream
+        print(f"[on_turn_error] {error}")
+        print(traceback.format_exc())
+        # Log ke App Insights (table 'traces' / 'exceptions')
+        logging.exception("on_turn_error")
+        # (opsional) kabari user
+        try:
+            await turn_context.send_activity("Maaf, terjadi error saat memproses pesan.")
+        except Exception:
+            pass
+
+    adapter.on_turn_error = on_error
 
 # ===========================================================
 #                 KONFIGURASI TRANSLATOR (ENV)
@@ -127,29 +144,27 @@ async def translate(req: TranslateRequest):
 
 # ===========================================================
 #                    BOT FRAMEWORK ENDPOINT
-#  Aman: untuk tes manual tanpa token → balas 401 (bukan 500)
-#  Tambah logging.exception agar failure terekam di App Insights
+#  Aman: tes manual tanpa token → 401 (bukan 500)
+#  Log exception ke Log stream & App Insights
 # ===========================================================
-# aktifkan logging INFO
 logging.basicConfig(level=logging.INFO)
 
 @app.post("/api/messages")
 async def messages(request: Request):
-    # 1) Pastikan adapter & bot siap
+    # 1) adapter/bot harus siap
     if not adapter or not bot:
         raise HTTPException(status_code=503, detail={
             "error": "bot_unavailable",
             "botbuilder_available": BOTBUILDER_AVAILABLE,
-            "bot_import_error": BOT_IMPORT_ERROR,
-            "hint": "Pastikan botbuilder-core terpasang dan App Settings MicrosoftAppId/MicrosoftAppPassword terisi, lalu restart."
+            "bot_import_error": BOT_IMPORT_ERROR
         })
 
-    # 2) Jika tidak ada token Bearer dari Azure Bot Service → 401 (tes manual)
+    # 2) Tanpa token Bearer dari Azure Bot Service → 401 (tes manual)
     auth_header = request.headers.get("Authorization", "")
     if not auth_header or not auth_header.lower().startswith("bearer "):
         return Response(status_code=401)
 
-    # 3) Validasi body minimal supaya tidak 500 saat payload tidak lengkap
+    # 3) Body harus JSON valid Activity
     try:
         body = await request.json()
     except Exception:
@@ -160,7 +175,7 @@ async def messages(request: Request):
     except Exception:
         return Response(status_code=400)
 
-    # 4) Proses turn bot (dengan token Bearer dari Bot Service) + log exception
+    # 4) Proses turn; jika 500, pastikan ter-log
     try:
         async def aux_turn(tc):
             await bot.on_turn(tc)
@@ -172,5 +187,5 @@ async def messages(request: Request):
         print(f"/api/messages error: {e}")
         print(traceback.format_exc())
         # ke Application Insights
-        logging.exception("bot process_activity failed")
+        logging.exception("process_activity failed")
         return Response(status_code=500)
