@@ -1,10 +1,13 @@
 from botbuilder.core import ActivityHandler, TurnContext
-import os, httpx, uuid
+import os, httpx, uuid, logging
 
-# Menggunakan endpoint global (api.cognitive.microsofttranslator.com)
+# Endpoint GLOBAL (api.cognitive.microsofttranslator.com)
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
+
+# Logging dasar (tersalur ke Log Stream & App Insights traces)
+logging.basicConfig(level=logging.INFO)
 
 
 class TranslatorBot(ActivityHandler):
@@ -18,11 +21,20 @@ class TranslatorBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: TurnContext):
         text = (turn_context.activity.text or "").strip()
+        logging.info(f"[bot] pesan diterima: {text!r}")
+
+        # 1) Kirim ECHO dulu sebagai diagnostik
+        try:
+            await turn_context.send_activity(f"Echo: {text}")
+        except Exception as e:
+            logging.exception(f"[bot] gagal kirim echo: {e}")
+
+        # 2) Parsing pola arah bahasa
         from_lang, to_lang, content = self._parse_direction(text)
 
         if not content:
             await turn_context.send_activity(
-                "Format: `id->en Selamat pagi` atau ketik kalimat (default id->en)."
+                "Format: `id->en Selamat pagi` atau ketik kalimat langsung (default id->en)."
             )
             return
 
@@ -30,14 +42,14 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity("Translator belum dikonfigurasi di server.")
             return
 
-        # ENDPOINT GLOBAL → path: /translate?api-version=3.0
+        # 3) Panggil Translator (endpoint global → /translate?api-version=3.0)
         url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
         if from_lang:
             url += f"&from={from_lang}"
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk endpoint global
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk global
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -47,9 +59,10 @@ class TranslatorBot(ActivityHandler):
                 res = await client.post(url, json=[{"Text": content}], headers=headers)
 
             if res.status_code >= 400:
-                await turn_context.send_activity(
-                    f"Error Translator {res.status_code}: {res.text}"
-                )
+                # Balas pesan error dari Translator agar terlihat di Web Chat
+                msg = f"Translator error {res.status_code}: {res.text}"
+                logging.warning(f"[bot] {msg}")
+                await turn_context.send_activity(msg)
                 return
 
             data = res.json()
@@ -57,13 +70,17 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity(translated)
 
         except Exception as e:
+            logging.exception(f"[bot] gagal memanggil Translator: {e}")
             await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
     def _parse_direction(self, text: str):
-        # Pola: "xx->yy kalimat". Jika tidak ada, auto-detect source (None), target=en.
+        """
+        Pola: "xx->yy kalimat". Jika tidak ada, auto-detect source (None), target=en.
+        """
         default_to = "en"
         if not text:
             return None, default_to, ""
+
         parts = text.split(" ")
         first = parts[0]
         if "->" in first and len(parts) > 1:
