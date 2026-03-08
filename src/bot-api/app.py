@@ -28,19 +28,29 @@ except Exception as e:
 
 MICROSOFT_APP_ID = os.getenv("MicrosoftAppId")
 MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
+MICROSOFT_APP_TENANT = os.getenv("MicrosoftAppTenantId")  # <-- tenant GUID kita ambil dari App Settings
 
 adapter = None
 bot = TranslatorBot() if TranslatorBot else None
 
 def try_create_adapter():
-    """Buat adapter hanya jika paket botbuilder ada dan kredensial tersedia."""
+    """
+    Buat adapter hanya jika paket botbuilder ada dan kredensial tersedia.
+    PENTING: di Python, Single-Tenant HARUS diset via channel_auth_tenant.
+    """
     if not BOTBUILDER_AVAILABLE:
         return None
     app_id = os.getenv("MicrosoftAppId")
     app_pw = os.getenv("MicrosoftAppPassword")
+    tenant = os.getenv("MicrosoftAppTenantId")  # GUID tenant kamu
     if not app_id or not app_pw:
         return None
-    settings = BotFrameworkAdapterSettings(app_id=app_id, app_password=app_pw)
+    # ➜ beri tahu SDK bahwa ini Single-Tenant dengan tenant GUID
+    settings = BotFrameworkAdapterSettings(
+        app_id=app_id,
+        app_password=app_pw,
+        channel_auth_tenant=tenant  # <— inilah kuncinya
+    )
     return BotFrameworkAdapter(settings)
 
 adapter = try_create_adapter()
@@ -60,6 +70,14 @@ if adapter is not None:
             pass
 
     adapter.on_turn_error = on_error
+
+# (OPSIONAL) Diagnostic startup – tampil di Log stream
+print(
+    "BOT_CFG:",
+    "app_id_prefix=", (MICROSOFT_APP_ID or "")[:8],
+    "pwd_len=", len(MICROSOFT_APP_PASSWORD or ""),
+    "tenant=", MICROSOFT_APP_TENANT
+)
 
 # ===========================================================
 #                 KONFIGURASI TRANSLATOR (ENV)
