@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
-import os, uuid, httpx
+import os, uuid, httpx, logging, traceback
 
 app = FastAPI(title="KID AI Translator API")
 
@@ -128,7 +128,11 @@ async def translate(req: TranslateRequest):
 # ===========================================================
 #                    BOT FRAMEWORK ENDPOINT
 #  Aman: untuk tes manual tanpa token → balas 401 (bukan 500)
+#  Tambah logging.exception agar failure terekam di App Insights
 # ===========================================================
+# aktifkan logging INFO
+logging.basicConfig(level=logging.INFO)
+
 @app.post("/api/messages")
 async def messages(request: Request):
     # 1) Pastikan adapter & bot siap
@@ -156,7 +160,7 @@ async def messages(request: Request):
     except Exception:
         return Response(status_code=400)
 
-    # 4) Proses turn bot (dengan token Bearer dari Bot Service)
+    # 4) Proses turn bot (dengan token Bearer dari Bot Service) + log exception
     try:
         async def aux_turn(tc):
             await bot.on_turn(tc)
@@ -164,5 +168,9 @@ async def messages(request: Request):
         await adapter.process_activity(activity, auth_header, aux_turn)
         return Response(status_code=201)
     except Exception as e:
-        print(f"/api/messages error: {e}")  # terlihat di Log stream
+        # ke Log stream
+        print(f"/api/messages error: {e}")
+        print(traceback.format_exc())
+        # ke Application Insights
+        logging.exception("bot process_activity failed")
         return Response(status_code=500)
