@@ -1,89 +1,190 @@
-from botbuilder.core import ActivityHandler, TurnContext
-import os, httpx, uuid, logging
+from fastapi import FastAPI, Request, Response, HTTPException
+from pydantic import BaseModel
+import os, uuid, httpx, logging, traceback
 
-# Endpoint GLOBAL (api.cognitive.microsofttranslator.com)
+app = FastAPI(title="KID AI Translator API")
+
+# ===========================================================
+#              GUARD untuk Bot Framework (AMAN)
+# -> Jika paket/credential belum siap, app tetap hidup.
+# ===========================================================
+BOT_IMPORT_ERROR = None
+BOTBUILDER_AVAILABLE = False
+try:
+    from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings
+    from botbuilder.schema import Activity
+    BOTBUILDER_AVAILABLE = True
+except Exception as e:
+    BOT_IMPORT_ERROR = str(e)
+    BOTBUILDER_AVAILABLE = False
+
+# ABSOLUTE import untuk logic bot (src/bot-api/bot.py)
+try:
+    from bot import TranslatorBot
+except Exception as e:
+    TranslatorBot = None
+    if BOT_IMPORT_ERROR is None:
+        BOT_IMPORT_ERROR = f"import bot module failed: {e}"
+
+MICROSOFT_APP_ID = os.getenv("MicrosoftAppId")
+MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
+
+adapter = None
+bot = TranslatorBot() if TranslatorBot else None
+
+def try_create_adapter():
+    """Buat adapter hanya jika paket botbuilder ada dan kredensial tersedia."""
+    if not BOTBUILDER_AVAILABLE:
+        return None
+    app_id = os.getenv("MicrosoftAppId")
+    app_pw = os.getenv("MicrosoftAppPassword")
+    if not app_id or not app_pw:
+        return None
+    settings = BotFrameworkAdapterSettings(app_id=app_id, app_password=app_pw)
+    return BotFrameworkAdapter(settings)
+
+adapter = try_create_adapter()
+
+# Tambahkan handler error agar error di pipeline adapter tercatat
+if adapter is not None:
+    async def on_error(turn_context, error: Exception):
+        # Log ke Log stream
+        print(f"[on_turn_error] {error}")
+        print(traceback.format_exc())
+        # Log ke App Insights (table 'traces' / 'exceptions')
+        logging.exception("on_turn_error")
+        # (opsional) kabari user
+        try:
+            await turn_context.send_activity("Maaf, terjadi error saat memproses pesan.")
+        except Exception:
+            pass
+
+    adapter.on_turn_error = on_error
+
+# ===========================================================
+#                 KONFIGURASI TRANSLATOR (ENV)
+# ===========================================================
+# ENDPOINT GLOBAL: https://api.cognitive.microsofttranslator.com/
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
-# Logging dasar (tersalur ke Log Stream & App Insights traces)
+# ===========================================================
+#                      MODEL REQUEST
+# ===========================================================
+class TranslateRequest(BaseModel):
+    text: str
+    to: str = "en"
+    from_lang: str | None = None
+
+# ===========================================================
+#                         HEALTH
+# ===========================================================
+@app.get("/healthz")
+def health():
+    return {
+        "status": "ok",
+        "translator_cfg": {
+            "endpoint_set": bool(TRANSLATOR_ENDPOINT),
+            "region_set":   bool(TRANSLATOR_REGION),
+            "key_set":      bool(TRANSLATOR_KEY),
+        },
+        "bot_cfg": {
+            "app_id_set":           bool(MICROSOFT_APP_ID),
+            "app_password_set":     bool(MICROSOFT_APP_PASSWORD),
+            "botbuilder_available": BOTBUILDER_AVAILABLE,
+            "adapter_ready":        adapter is not None,
+            "bot_import_error":     BOT_IMPORT_ERROR if not BOTBUILDER_AVAILABLE else None
+        }
+    }
+
+# ===========================================================
+#                        TRANSLATE
+# ===========================================================
+@app.post("/translate")
+async def translate(req: TranslateRequest):
+    if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
+        raise HTTPException(status_code=500, detail="translator_not_configured")
+
+    # ✅ Karena pakai endpoint global → path /translate?api-version=3.0
+    url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={req.to}"
+    if req.from_lang:
+        url += f"&from={req.from_lang}"
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
+        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk endpoint global
+        "Content-type": "application/json",
+        "X-ClientTraceId": str(uuid.uuid4())
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=[{"Text": req.text}], headers=headers)
+
+            # Tampilkan detail error asli jika Translator balas 4xx/5xx
+            if r.status_code >= 400:
+                raise HTTPException(status_code=r.status_code, detail={
+                    "message": "translator_error",
+                    "status_code": r.status_code,
+                    "body": r.text
+                })
+
+            data = r.json()
+
+    except httpx.RequestError as e:
+        # Jaringan / timeout menuju Translator
+        raise HTTPException(status_code=502, detail=f"translator_unreachable: {e}")
+
+    return {
+        "detectedLanguage": data[0].get("detectedLanguage"),
+        "translations":     data[0].get("translations", [])
+    }
+
+# ===========================================================
+#                    BOT FRAMEWORK ENDPOINT
+#  Aman: tes manual tanpa token → 401 (bukan 500)
+#  Log exception ke Log stream & App Insights
+# ===========================================================
 logging.basicConfig(level=logging.INFO)
 
+@app.post("/api/messages")
+async def messages(request: Request):
+    # 1) adapter/bot harus siap
+    if not adapter or not bot:
+        raise HTTPException(status_code=503, detail={
+            "error": "bot_unavailable",
+            "botbuilder_available": BOTBUILDER_AVAILABLE,
+            "bot_import_error": BOT_IMPORT_ERROR
+        })
 
-class TranslatorBot(ActivityHandler):
-    async def on_members_added_activity(self, members_added, turn_context: TurnContext):
-        welcome = (
-            "Halo! 👋 Saya AI Translator.\n"
-            "Contoh: `id->en Selamat pagi` atau `ja->id おはようございます`\n"
-            "Jika tidak menulis arah, default `id->en`."
-        )
-        await turn_context.send_activity(welcome)
+    # 2) Tanpa token Bearer dari Azure Bot Service → 401 (tes manual)
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return Response(status_code=401)
 
-    async def on_message_activity(self, turn_context: TurnContext):
-        text = (turn_context.activity.text or "").strip()
-        logging.info(f"[bot] pesan diterima: {text!r}")
+    # 3) Body harus JSON valid Activity
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(status_code=400)
 
-        # 1) Kirim ECHO dulu sebagai diagnostik
-        try:
-            await turn_context.send_activity(f"Echo: {text}")
-        except Exception as e:
-            logging.exception(f"[bot] gagal kirim echo: {e}")
+    try:
+        activity = Activity().deserialize(body)
+    except Exception:
+        return Response(status_code=400)
 
-        # 2) Parsing pola arah bahasa
-        from_lang, to_lang, content = self._parse_direction(text)
+    # 4) Proses turn; jika 500, pastikan ter-log
+    try:
+        async def aux_turn(tc):
+            await bot.on_turn(tc)
 
-        if not content:
-            await turn_context.send_activity(
-                "Format: `id->en Selamat pagi` atau ketik kalimat langsung (default id->en)."
-            )
-            return
-
-        if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
-            await turn_context.send_activity("Translator belum dikonfigurasi di server.")
-            return
-
-        # 3) Panggil Translator (endpoint global → /translate?api-version=3.0)
-        url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
-        if from_lang:
-            url += f"&from={from_lang}"
-
-        headers = {
-            "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk global
-            "Content-type": "application/json",
-            "X-ClientTraceId": str(uuid.uuid4())
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                res = await client.post(url, json=[{"Text": content}], headers=headers)
-
-            if res.status_code >= 400:
-                # Balas pesan error dari Translator agar terlihat di Web Chat
-                msg = f"Translator error {res.status_code}: {res.text}"
-                logging.warning(f"[bot] {msg}")
-                await turn_context.send_activity(msg)
-                return
-
-            data = res.json()
-            translated = data[0]["translations"][0]["text"]
-            await turn_context.send_activity(translated)
-
-        except Exception as e:
-            logging.exception(f"[bot] gagal memanggil Translator: {e}")
-            await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
-
-    def _parse_direction(self, text: str):
-        """
-        Pola: "xx->yy kalimat". Jika tidak ada, auto-detect source (None), target=en.
-        """
-        default_to = "en"
-        if not text:
-            return None, default_to, ""
-
-        parts = text.split(" ")
-        first = parts[0]
-        if "->" in first and len(parts) > 1:
-            a, b = first.split("->", 1)
-            return a.lower(), b.lower(), " ".join(parts[1:])
-        return None, default_to, text
+        await adapter.process_activity(activity, auth_header, aux_turn)
+        return Response(status_code=201)
+    except Exception as e:
+        # ke Log stream
+        print(f"/api/messages error: {e}")
+        print(traceback.format_exc())
+        # ke Application Insights
+        logging.exception("process_activity failed")
+        return Response(status_code=500)
