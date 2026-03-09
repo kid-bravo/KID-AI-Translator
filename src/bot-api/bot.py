@@ -1,17 +1,18 @@
 from botbuilder.core import ActivityHandler, TurnContext
 import os, httpx, uuid, logging, asyncio, datetime
+from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
-# ============== Text Translation (GLOBAL endpoint) ==============
+# ===================== Translator (Text - GLOBAL) =====================
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
-# ============== Document Translation (RESOURCE endpoint) =========
-# Contoh: https://<nama-resource>.cognitiveservices.azure.com
+# ===== Translator (Document Translation - RESOURCE endpoint) ==========
+# Contoh BENAR: https://<nama-resource>.cognitiveservices.azure.com
 DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
 DOC_TRANSLATION_KEY      = os.getenv("DOC_TRANSLATION_KEY") or os.getenv("TRANSLATOR_KEY")
 
-# ============== Storage (Blob) ==================================
+# ===================== Storage (Blob) =================================
 from azure.storage.blob import (
     BlobServiceClient, generate_blob_sas, BlobSasPermissions,
     generate_container_sas, ContainerSasPermissions
@@ -21,7 +22,7 @@ STORAGE_ACCOUNT_KEY       = os.getenv("STORAGE_ACCOUNT_KEY")
 STORAGE_CONTAINER_SOURCE  = os.getenv("STORAGE_CONTAINER_SOURCE", "input")
 STORAGE_CONTAINER_TARGET  = os.getenv("STORAGE_CONTAINER_TARGET", "output")
 
-# ============== Bot Credentials (protected downloads) ============
+# ===================== Bot Credentials (protected downloads) ==========
 try:
     from botframework.connector.auth import MicrosoftAppCredentials
 except Exception:
@@ -33,7 +34,22 @@ logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
 
 
+def _mask_sas(url: str) -> str:
+    """Mask parameter 'sig' di URL SAS untuk keamanan log."""
+    try:
+        parts = urlsplit(url)
+        qs = dict(parse_qsl(parts.query))
+        if "sig" in qs:
+            qs["sig"] = "***masked***"
+        new_q = urlencode(qs, doseq=True)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_q, parts.fragment))
+    except Exception:
+        return url
+
+
 class TranslatorBot(ActivityHandler):
+
+    # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         welcome = (
             "Halo! 👋 Saya **KID AI Translator**.\n"
@@ -43,9 +59,11 @@ class TranslatorBot(ActivityHandler):
         )
         await turn_context.send_activity(welcome)
 
+    # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
         text = (turn_context.activity.text or "").strip()
 
+        # Heartbeat
         if text.lower() == "ping":
             await turn_context.send_activity("pong")
             return
@@ -53,7 +71,7 @@ class TranslatorBot(ActivityHandler):
         # ---- Dokumen ----
         if turn_context.activity.attachments:
             try:
-                await self._handle_attachments(turn_context)
+                await self._handle_attachments(turn_context)  # default target: en
             except Exception as e:
                 logging.exception("handle_attachments failed")
                 await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
@@ -68,20 +86,23 @@ class TranslatorBot(ActivityHandler):
             return
 
         if len(content) > MAX_TEXT_LEN:
-            await turn_context.send_activity(f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter.")
+            await turn_context.send_activity(
+                f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter."
+            )
             return
 
         if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
             await turn_context.send_activity("Translator (text) belum dikonfigurasi di server.")
             return
 
+        # GLOBAL endpoint → /translate?api-version=3.0
         url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
         if from_lang:
             url += f"&from={from_lang}"
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -101,6 +122,10 @@ class TranslatorBot(ActivityHandler):
 
     # ---------- Helper: parse 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
+        """
+        Return (from_lang, to_lang, content).
+        Jika tidak ada 'xx->yy', from_lang=None (auto), to_lang='en'.
+        """
         default_to = "en"
         if not text:
             return None, default_to, ""
@@ -185,6 +210,7 @@ class TranslatorBot(ActivityHandler):
         # 4) SAS folder (path dulu, lalu ?sas). Expire 4 jam.
         expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
 
+        # SOURCE: butuh read + list
         sas_src = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
@@ -194,15 +220,20 @@ class TranslatorBot(ActivityHandler):
         )
         source_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}/{job_id}?{sas_src}"
 
+        # TARGET: butuh write + add + create + list (+ read untuk beberapa probe)
         sas_tgt = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
             account_key=STORAGE_ACCOUNT_KEY,
-            # tambahkan read juga (beberapa validasi melakukan probe)
             permission=ContainerSasPermissions(write=True, add=True, create=True, list=True, read=True),
             expiry=expiry
         )
         target_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_tgt}"
+
+        # ---- DEBUG LOG SAS (TER-MASKING) ----
+        logging.warning(f"[DEBUG-SAS] SOURCE_URL = {_mask_sas(source_url)}")
+        logging.warning(f"[DEBUG-SAS] TARGET_URL = {_mask_sas(target_url)}")
+        # -------------------------------------
 
         # 5) Submit batch (endpoint resource + key resource)
         batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"
@@ -246,7 +277,8 @@ class TranslatorBot(ActivityHandler):
                         err_msg = " | ".join(parts)
 
                     docs_url = (status_url.rstrip("/")) + "/documents?skip=0&top=20"
-                    d = await httpx.AsyncClient(timeout=15).get(docs_url, headers=headers)
+                    async with httpx.AsyncClient(timeout=15) as c2:
+                        d = await c2.get(docs_url, headers=headers)
                     if d.status_code == 200:
                         dj = d.json()
                         failed = [
