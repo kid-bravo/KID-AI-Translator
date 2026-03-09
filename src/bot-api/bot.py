@@ -251,9 +251,41 @@ class TranslatorBot(ActivityHandler):
                         break
                     await asyncio.sleep(3)
 
-            if data.get("status") != "Succeeded":
-                await turn_context.send_activity(f"Job gagal/berhenti. Status: **{data.get('status')}**")
-                return
+           if data.get("status") != "Succeeded":
+    # Coba ambil detail error ringkas dari respons job
+    err_msg = None
+    try:
+        # Banyak error muncul di data["errors"] atau data["summary"] atau endpoint /documents
+        errors = data.get("errors") or []
+        if errors:
+            # Ambil 1–2 error teratas
+            parts = []
+            for e in errors[:2]:
+                parts.append(f"{e.get('code')}: {e.get('message')}")
+            err_msg = " | ".join(parts)
+
+        # Ambil detail per dokumen (sering kali ada alasan validasi di sini)
+        async with httpx.AsyncClient(timeout=15) as c2:
+            docs_url = (status_url.rstrip("/")) + "/documents?skip=0&top=20"
+            d = await c2.get(docs_url, headers=headers)
+            if d.status_code == 200:
+                dj = d.json()
+                # cari dokumen yang Failed/Cancelled
+                failed = [
+                    f"[{it.get('id')}] {it.get('path')} → {it.get('status')} "
+                    f"{(it.get('error') or {}).get('code')}: {(it.get('error') or {}).get('message')}"
+                    for it in (dj.get('value') or []) if it.get('status') not in ('Succeeded', 'Running')
+                ]
+                if failed and not err_msg:
+                    err_msg = " ; ".join(failed[:2])
+    except Exception:
+        pass
+
+    msg = f"Job gagal/berhenti. Status: **{data.get('status')}**"
+    if err_msg:
+        msg += f" — Detail: {err_msg}"
+    await turn_context.send_activity(msg)
+    return
 
             # 7) Enumerasi hasil di output/<jobId>/
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
