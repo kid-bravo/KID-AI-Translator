@@ -1,5 +1,5 @@
 from botbuilder.core import ActivityHandler, TurnContext
-import os, httpx, uuid, logging, asyncio, datetime
+import os, httpx, uuid, logging, asyncio, datetime, json
 from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
 # ===================== Translator (Text - GLOBAL) =====================
@@ -202,10 +202,9 @@ class TranslatorBot(ActivityHandler):
             file_bytes, overwrite=True
         )
 
-        # 4) SAS CONTAINER + filter.prefix (paling aman)
+        # 4) SAS CONTAINER + filter.prefix (paling aman) — Expire 4 jam.
         expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
 
-        # SOURCE CONTAINER SAS (read + list)
         sas_src_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
@@ -213,7 +212,6 @@ class TranslatorBot(ActivityHandler):
             permission=ContainerSasPermissions(read=True, list=True),
             expiry=expiry
         )
-        # Target CONTAINER SAS (write + add + create + list + read)
         sas_tgt_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
@@ -222,7 +220,6 @@ class TranslatorBot(ActivityHandler):
             expiry=expiry
         )
 
-        # URL SAS level CONTAINER
         source_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}?{sas_src_container}"
         target_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}?{sas_tgt_container}"
 
@@ -232,7 +229,7 @@ class TranslatorBot(ActivityHandler):
         logging.warning(f"[DEBUG-SAS] FILTER_PREFIX = {job_id}/")
         # -------------------------------------
 
-        # 5) Submit batch: sourceUrl = CONTAINER, filter.prefix = "<jobId>/"
+        # 5) Submit batch (sourceUrl=CONTAINER + filter.prefix)
         batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": DOC_TRANSLATION_KEY,
@@ -245,7 +242,6 @@ class TranslatorBot(ActivityHandler):
                     "filter": { "prefix": f"{job_id}/" }
                 },
                 "targets": [{
-                    # targetUrl boleh container + subfolder
                     "targetUrl": f"{target_container_url}/{job_id}",
                     "language": to_lang
                 }]
@@ -261,18 +257,18 @@ class TranslatorBot(ActivityHandler):
 
         await turn_context.send_activity(f"Job diterima untuk **{name}**. Menunggu hasil…")
 
-        # 6) Poll status
+        # 6) Poll status + tampilkan DETAIL kalau gagal
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 for _ in range(30):
                     s = await client.get(status_url, headers=headers)
                     data = s.json()
-                    if data.get("status") in ("Succeeded", "Failed", "Cancelled"):
+                    if data.get("status") in ("Succeeded", "Failed", "Cancelled", "ValidationFailed"):
                         break
                     await asyncio.sleep(3)
 
             if data.get("status") != "Succeeded":
-                # tarik detail error dari job & per-dokumen
+                # ---- tarik detail error dari job & per-dokumen
                 err_msg = None
                 try:
                     errs = data.get("errors") or []
@@ -294,9 +290,13 @@ class TranslatorBot(ActivityHandler):
                 except Exception as ex:
                     logging.exception(f"pull-detail-failed: {ex}")
 
+                # ---- kirim juga RAW job (dipotong) agar pasti ada konteks
+                raw_snippet = json.dumps(data)[:1200]
+
                 msg = f"Job gagal/berhenti. Status: **{data.get('status')}**"
                 if err_msg:
                     msg += f" — Detail: {err_msg}"
+                msg += f"\n\nRAW job (snippet): ```{raw_snippet}```"
                 await turn_context.send_activity(msg)
                 return
 
