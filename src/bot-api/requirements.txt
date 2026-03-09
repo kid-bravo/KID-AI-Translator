@@ -10,3 +10,13 @@ botbuilder-core==4.14.6
 aiohttp==3.9.3
 
 azure-storage-blob==12.20.0
+
+
+# Azure Blob Storage (WAJIB untuk alur dokumen)
+azure-storage-blob==12.20.0
+azure-core>=1.29.0
+
+
+# (opsional tapi aman dipasang)
+typing_extensions>=4.7.0
+
