@@ -1,16 +1,16 @@
 from botbuilder.core import ActivityHandler, TurnContext
 import os, httpx, uuid, logging, asyncio, datetime
 
-# ====== Translator (Text → GLOBAL endpoint) ======
+# ===================== Translator (Text - GLOBAL) =====================
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
-# ====== Translator (Document Translation → RESOURCE endpoint) ======
-# Harus berbentuk: https://<nama-resource>.cognitiveservices.azure.com
+# ===== Translator (Document Translation - RESOURCE endpoint AT COGNITIVESERVICES) =====
+# Contoh BENAR: https://kid-translator-res.cognitiveservices.azure.com
 DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
 
-# ====== Storage (Document Translation) ======
+# ===================== Storage (Blob) =====================
 from azure.storage.blob import (
     BlobServiceClient, generate_blob_sas, BlobSasPermissions,
     generate_container_sas, ContainerSasPermissions
@@ -20,8 +20,11 @@ STORAGE_ACCOUNT_KEY       = os.getenv("STORAGE_ACCOUNT_KEY")
 STORAGE_CONTAINER_SOURCE  = os.getenv("STORAGE_CONTAINER_SOURCE", "input")
 STORAGE_CONTAINER_TARGET  = os.getenv("STORAGE_CONTAINER_TARGET", "output")
 
-# ====== Kredensial Bot (untuk unduh lampiran protected) ======
-from botframework.connector.auth import MicrosoftAppCredentials
+# ===================== Bot Credentials (for protected downloads) =====================
+try:
+    from botframework.connector.auth import MicrosoftAppCredentials
+except Exception:
+    MicrosoftAppCredentials = None  # safety
 MICROSOFT_APP_ID       = os.getenv("MicrosoftAppId")
 MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
 
@@ -30,24 +33,27 @@ MAX_TEXT_LEN = 5000
 
 
 class TranslatorBot(ActivityHandler):
+
+    # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         welcome = (
-            "Halo! 👋 Saya AI Translator.\n"
-            "• Teks: `id->en Selamat pagi` atau ketik kalimat (default id->en)\n"
-            "• Dokumen: unggah PDF/DOCX/PPTX/XLSX ke chat ini\n"
+            "Halo! 👋 Saya **KID AI Translator**.\n"
+            "• **Teks**: `id->en Selamat pagi` atau ketik kalimat (default id->en)\n"
+            "• **Dokumen**: unggah **PDF/DOCX/PPTX/XLSX** ke chat ini\n"
             "Ketik `ping` untuk uji sambungan."
         )
         await turn_context.send_activity(welcome)
 
+    # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
         text = (turn_context.activity.text or "").strip()
 
-        # Heartbeat — cek jalur pesan
+        # Heartbeat
         if text.lower() == "ping":
             await turn_context.send_activity("pong")
             return
 
-        # ===== Attachment? → proses dokumen =====
+        # ---- Document path ----
         if turn_context.activity.attachments:
             try:
                 await self._handle_attachments(turn_context)  # default target: en
@@ -56,9 +62,8 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
             return
 
-        # ===== Alur TEKS =====
+        # ---- Text path ----
         from_lang, to_lang, content = self._parse_direction(text)
-
         if not content:
             await turn_context.send_activity(
                 "Format: `id->en Selamat pagi` atau ketik kalimat (default id->en)."
@@ -72,7 +77,7 @@ class TranslatorBot(ActivityHandler):
             return
 
         if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
-            await turn_context.send_activity("Translator belum dikonfigurasi di server.")
+            await turn_context.send_activity("Translator (text) belum dikonfigurasi di server.")
             return
 
         # GLOBAL endpoint → /translate?api-version=3.0
@@ -82,7 +87,7 @@ class TranslatorBot(ActivityHandler):
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk global
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -100,7 +105,7 @@ class TranslatorBot(ActivityHandler):
             logging.exception("translate-text failed")
             await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
-    # ===== Parser arah 'xx->yy kalimat' =====
+    # ---------------------- Helper: parse 'xx->yy kalimat' ----------------------
     def _parse_direction(self, text: str):
         """
         Return (from_lang, to_lang, content).
@@ -116,13 +121,13 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
-    # ===== Document Translation handler (fixed endpoint + SAS folder + downloadUrl) =====
+    # ---------------------- Document Translation Handler ----------------------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
-        # 0) Validasi endpoint batch (bukan global)
+        # 0) Validasi endpoint batch (harus endpoint resource, bukan global)
         if not DOC_TRANSLATION_ENDPOINT or "cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT:
             await turn_context.send_activity(
                 "Konfigurasi belum lengkap: `DOC_TRANSLATION_ENDPOINT` harus diisi "
-                "dengan endpoint resource Translator, contoh:\n"
+                "dengan endpoint **resource** Translator, contoh:\n"
                 "`https://<nama-resource>.cognitiveservices.azure.com`"
             )
             return
@@ -135,7 +140,7 @@ class TranslatorBot(ActivityHandler):
 
         logging.info(f"[att] name={name} type={att_type} url={content_url}")
 
-        # 1) Tentukan URL unduh yang benar:
+        # 1) Tentukan URL unduh yang benar
         #    - Jika ada content.downloadUrl (Teams File Download Info) → pakai itu
         #    - Jika tidak, pakai attachment.content_url
         download_url = None
@@ -158,8 +163,8 @@ class TranslatorBot(ActivityHandler):
                 if r.status_code == 200 and r.content:
                     file_bytes = r.content
                 else:
-                    if not (MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD):
-                        raise Exception(f"contentUrl protected ({r.status_code}) dan bot tidak punya kredensial.")
+                    if not (MicrosoftAppCredentials and MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD):
+                        raise Exception(f"contentUrl protected ({r.status_code}) dan kredensial bot tidak tersedia.")
                     creds = MicrosoftAppCredentials(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
                     token = await creds.get_access_token()
                     r2 = await client.get(download_url, headers={"Authorization": f"Bearer {token}"})
@@ -168,12 +173,12 @@ class TranslatorBot(ActivityHandler):
         except Exception:
             logging.exception("download attachment failed")
             await turn_context.send_activity(
-                "Gagal mengunduh file dari Teams. Coba drag-&-drop dari perangkat. "
-                "Jika tetap gagal, kemungkinan file tersimpan di OneDrive/SharePoint (perlu izin Graph)."
+                "Gagal mengunduh file dari Teams. Coba **drag-&-drop dari perangkat**. "
+                "Jika tetap gagal, kemungkinan file tersimpan di OneDrive/SharePoint (butuh izin Graph)."
             )
             return
 
-        # 3) Upload ke Blob input/<jobId>/<namaFile>
+        # 3) Upload ke Blob input/<jobId>/<file>
         if not (STORAGE_ACCOUNT_NAME and STORAGE_ACCOUNT_KEY):
             await turn_context.send_activity("Storage belum dikonfigurasi di server.")
             return
@@ -189,9 +194,9 @@ class TranslatorBot(ActivityHandler):
             file_bytes, overwrite=True
         )
 
-        # 4) Buat SAS FOLDER (PERHATIKAN URUTAN: path dahulu, baru ?sas)
-        #    Source:  https://.../input/<jobId>?<sas with read+list>
-        #    Target:  https://.../output/<jobId>?<sas with write+add+create+list>
+        # 4) Buat SAS FOLDER (PERHATIKAN: path dahulu, kemudian ?sas)
+        #    Source: https://.../input/<jobId>?<sas (read+list)>
+        #    Target: https://.../output/<jobId>?<sas (write+add+create+list)>
         sas_read_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
@@ -216,7 +221,7 @@ class TranslatorBot(ActivityHandler):
             f"{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_write_container}"
         )
 
-        # 5) Submit Document Translation (Batch API) → gunakan ENDPOINT RESOURCE
+        # 5) Submit Document Translation (Batch API) — gunakan ENDPOINT RESOURCE
         batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.1/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
@@ -251,46 +256,40 @@ class TranslatorBot(ActivityHandler):
                         break
                     await asyncio.sleep(3)
 
-           if data.get("status") != "Succeeded":
-    # Coba ambil detail error ringkas dari respons job
-    err_msg = None
-    try:
-        # Banyak error muncul di data["errors"] atau data["summary"] atau endpoint /documents
-        errors = data.get("errors") or []
-        if errors:
-            # Ambil 1–2 error teratas
-            parts = []
-            for e in errors[:2]:
-                parts.append(f"{e.get('code')}: {e.get('message')}")
-            err_msg = " | ".join(parts)
+            if data.get("status") != "Succeeded":
+                # Tarik detail error ringkas dari job & per dokumen (supaya tahu penyebab)
+                err_msg = None
+                try:
+                    errors = data.get("errors") or []
+                    if errors:
+                        parts = []
+                        for e in errors[:2]:
+                            parts.append(f"{e.get('code')}: {e.get('message')}")
+                        err_msg = " | ".join(parts)
+                    # detail dokumen
+                    docs_url = (status_url.rstrip("/")) + "/documents?skip=0&top=20"
+                    d = await httpx.AsyncClient(timeout=15).get(docs_url, headers=headers)
+                    if d.status_code == 200:
+                        dj = d.json()
+                        failed = [
+                            f"[{it.get('id')}] {it.get('path')} → {it.get('status')} "
+                            f"{(it.get('error') or {}).get('code')}: {(it.get('error') or {}).get('message')}"
+                            for it in (dj.get('value') or []) if it.get('status') not in ('Succeeded', 'Running')
+                        ]
+                        if failed and not err_msg:
+                            err_msg = " ; ".join(failed[:2])
+                except Exception:
+                    pass
 
-        # Ambil detail per dokumen (sering kali ada alasan validasi di sini)
-        async with httpx.AsyncClient(timeout=15) as c2:
-            docs_url = (status_url.rstrip("/")) + "/documents?skip=0&top=20"
-            d = await c2.get(docs_url, headers=headers)
-            if d.status_code == 200:
-                dj = d.json()
-                # cari dokumen yang Failed/Cancelled
-                failed = [
-                    f"[{it.get('id')}] {it.get('path')} → {it.get('status')} "
-                    f"{(it.get('error') or {}).get('code')}: {(it.get('error') or {}).get('message')}"
-                    for it in (dj.get('value') or []) if it.get('status') not in ('Succeeded', 'Running')
-                ]
-                if failed and not err_msg:
-                    err_msg = " ; ".join(failed[:2])
-    except Exception:
-        pass
-
-    msg = f"Job gagal/berhenti. Status: **{data.get('status')}**"
-    if err_msg:
-        msg += f" — Detail: {err_msg}"
-    await turn_context.send_activity(msg)
-    return
+                msg = f"Job gagal/berhenti. Status: **{data.get('status')}**"
+                if err_msg:
+                    msg += f" — Detail: {err_msg}"
+                await turn_context.send_activity(msg)
+                return
 
             # 7) Enumerasi hasil di output/<jobId>/
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
-
             if not blobs:
                 await turn_context.send_activity("Job selesai tapi file hasil tidak ditemukan.")
                 return
