@@ -6,7 +6,7 @@ TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
-# ====== Storage (untuk Document Translation) ======
+# ====== Storage (Document Translation) ======
 from azure.storage.blob import (
     BlobServiceClient, generate_blob_sas, BlobSasPermissions,
     generate_container_sas, ContainerSasPermissions
@@ -15,6 +15,12 @@ STORAGE_ACCOUNT_NAME      = os.getenv("STORAGE_ACCOUNT_NAME")
 STORAGE_ACCOUNT_KEY       = os.getenv("STORAGE_ACCOUNT_KEY")
 STORAGE_CONTAINER_SOURCE  = os.getenv("STORAGE_CONTAINER_SOURCE", "input")
 STORAGE_CONTAINER_TARGET  = os.getenv("STORAGE_CONTAINER_TARGET", "output")
+
+# ====== Ambil kredensial bot untuk access token (untuk unduh konten Teams yang protected) ======
+from botframework.connector.auth import MicrosoftAppCredentials
+
+MICROSOFT_APP_ID       = os.getenv("MicrosoftAppId")
+MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
 
 logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
@@ -38,7 +44,7 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity("pong")
             return
 
-        # ===== 5.1: panggil handler dokumen saat ada lampiran =====
+        # ===== Attachment? → proses dokumen =====
         if turn_context.activity.attachments:
             try:
                 await self._handle_attachments(turn_context)  # default target: en
@@ -46,7 +52,6 @@ class TranslatorBot(ActivityHandler):
                 logging.exception("handle_attachments failed")
                 await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
             return
-        # ==========================================================
 
         # ===== Alur TEKS =====
         from_lang, to_lang, content = self._parse_direction(text)
@@ -108,20 +113,38 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
-    # ===== 5.2: Document Translation handler =====
+    # ===== Document Translation handler (dengan protected download fallback) =====
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
         att = turn_context.activity.attachments[0]
         name = att.name or f"file-{uuid.uuid4()}"
-        content_url = att.content_url
+        content_url = att.content_url or ""
 
-        # 1) Download file dari Teams (drag&drop biasanya langsung GET)
+        logging.info(f"[att] name={att.name} type={att.content_type} url={content_url}")
+
+        # 1) Download file dari Teams
+        file_bytes = None
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                res = await client.get(content_url)
-                res.raise_for_status()
-                file_bytes = res.content
-        except Exception:
-            await turn_context.send_activity("Gagal mengunduh file dari Teams. Coba drag-&-drop (bukan link).")
+                # Percobaan 1: tanpa auth
+                r = await client.get(content_url)
+                if r.status_code == 200 and r.content:
+                    file_bytes = r.content
+                else:
+                    # Percobaan 2: pakai Bearer token connector (bot credentials)
+                    if not (MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD):
+                        raise Exception(f"contentUrl protected ({r.status_code}) dan bot tidak punya kredensial.")
+
+                    creds = MicrosoftAppCredentials(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
+                    token = await creds.get_access_token()
+                    r2 = await client.get(content_url, headers={"Authorization": f"Bearer {token}"})
+                    r2.raise_for_status()
+                    file_bytes = r2.content
+        except Exception as e:
+            logging.exception("download attachment failed")
+            await turn_context.send_activity(
+                "Gagal mengunduh file dari Teams. Coba drag-&-drop dari perangkat. "
+                "Jika tetap gagal, kemungkinan file tersimpan di OneDrive/SharePoint (perlu izin Graph)."
+            )
             return
 
         # 2) Upload ke Blob input/
