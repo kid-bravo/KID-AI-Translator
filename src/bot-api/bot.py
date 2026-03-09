@@ -202,35 +202,37 @@ class TranslatorBot(ActivityHandler):
             file_bytes, overwrite=True
         )
 
-        # 4) SAS folder (path dulu, lalu ?sas). Expire 4 jam.
+        # 4) SAS CONTAINER + filter.prefix (paling aman)
         expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
 
-        # SOURCE: butuh read + list
-        sas_src = generate_container_sas(
+        # SOURCE CONTAINER SAS (read + list)
+        sas_src_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
             account_key=STORAGE_ACCOUNT_KEY,
             permission=ContainerSasPermissions(read=True, list=True),
             expiry=expiry
         )
-        source_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}/{job_id}?{sas_src}"
-
-        # TARGET: butuh write + add + create + list (+ read untuk beberapa probe)
-        sas_tgt = generate_container_sas(
+        # Target CONTAINER SAS (write + add + create + list + read)
+        sas_tgt_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
             account_key=STORAGE_ACCOUNT_KEY,
             permission=ContainerSasPermissions(write=True, add=True, create=True, list=True, read=True),
             expiry=expiry
         )
-        target_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_tgt}"
+
+        # URL SAS level CONTAINER
+        source_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}?{sas_src_container}"
+        target_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}?{sas_tgt_container}"
 
         # ---- DEBUG LOG SAS (TER-MASKING) ----
-        logging.warning(f"[DEBUG-SAS] SOURCE_URL = {_mask_sas(source_url)}")
-        logging.warning(f"[DEBUG-SAS] TARGET_URL = {_mask_sas(target_url)}")
+        logging.warning(f"[DEBUG-SAS] SOURCE_CONTAINER_URL = {_mask_sas(source_container_url)}")
+        logging.warning(f"[DEBUG-SAS] TARGET_CONTAINER_URL = {_mask_sas(target_container_url)}")
+        logging.warning(f"[DEBUG-SAS] FILTER_PREFIX = {job_id}/")
         # -------------------------------------
 
-        # 5) Submit batch (endpoint resource + key resource)
+        # 5) Submit batch: sourceUrl = CONTAINER, filter.prefix = "<jobId>/"
         batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": DOC_TRANSLATION_KEY,
@@ -238,8 +240,15 @@ class TranslatorBot(ActivityHandler):
         }
         payload = {
             "inputs": [{
-                "source":  {"sourceUrl": source_url},
-                "targets": [{"targetUrl": target_url, "language": to_lang}]
+                "source": {
+                    "sourceUrl": source_container_url,
+                    "filter": { "prefix": f"{job_id}/" }
+                },
+                "targets": [{
+                    # targetUrl boleh container + subfolder
+                    "targetUrl": f"{target_container_url}/{job_id}",
+                    "language": to_lang
+                }]
             }]
         }
 
