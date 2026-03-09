@@ -33,9 +33,31 @@ MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
 logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
 
+# ===================== Preferensi bahasa (in-memory) ==================
+# SESSIONS[user_id] = {"from_lang": None|"id"|..., "to_lang": "en"|...}
+SESSIONS = {}
 
+# ===================== Daftar bahasa di Card ==========================
+LANG_CHOICES = [
+    ("Indonesian (id)", "id"),
+    ("English (en)",    "en"),
+    ("Japanese (ja)",   "ja"),
+    ("Vietnamese (vi)", "vi"),
+    ("Lao (lo)",        "lo"),
+    ("Chinese (Simplified) (zh-Hans)", "zh-Hans"),
+    ("Chinese (Traditional) (zh-Hant)", "zh-Hant"),
+    ("Korean (ko)",     "ko"),
+    ("French (fr)",     "fr"),
+    ("German (de)",     "de"),
+    ("Spanish (es)",    "es"),
+    ("Thai (th)",       "th"),
+    ("Russian (ru)",    "ru"),
+    ("Filipino (fil)",  "fil"),
+    ("Portuguese (pt)", "pt"),
+]
+
+# ===================== Util: mask 'sig' SAS di log ====================
 def _mask_sas(url: str) -> str:
-    """Mask parameter 'sig' di URL SAS untuk keamanan log."""
     try:
         parts = urlsplit(url)
         qs = dict(parse_qsl(parts.query))
@@ -50,51 +72,74 @@ def _mask_sas(url: str) -> str:
 class TranslatorBot(ActivityHandler):
     # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
-        welcome = (
-            "Halo! 👋 Saya **KID AI Translator**.\n"
-            "• **Teks**: `id->en Selamat pagi` atau ketik kalimat (default id->en)\n"
-            "• **Dokumen**: unggah **PDF/DOCX/PPTX/XLSX** ke chat ini\n"
-            "Ketik `ping` untuk uji sambungan."
-        )
-        await turn_context.send_activity(welcome)
+        await self._send_menu_card(turn_context)
 
     # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
+        user_id = (turn_context.activity.from_property and turn_context.activity.from_property.id) or "unknown"
         text = (turn_context.activity.text or "").strip()
+        value = turn_context.activity.value or {}
 
-        # Heartbeat
-        if text.lower() == "ping":
+        # A) Submit dari Menu Card / Language Card
+        if isinstance(value, dict):
+            vtype  = value.get("type")
+            action = value.get("action")
+            if vtype == "menu" and action == "translate_document":
+                await self._send_language_card(turn_context, user_id)
+                return
+            if vtype == "menu" and action == "how_to_upload":
+                await self._send_howto(turn_context)
+                return
+            if vtype == "set_lang":
+                src = value.get("src_lang")  # "auto" / code
+                dst = value.get("dst_lang") or "en"
+                SESSIONS[user_id] = {"from_lang": (None if src in (None, "", "auto") else src), "to_lang": dst}
+                await turn_context.send_activity(
+                    f"Bahasa diset. Sumber: `{src or 'auto'}`, Tujuan: `{dst}`.\n"
+                    f"• Kirim teks untuk diterjemahkan **atau**\n"
+                    f"• Unggah dokumen (PDF/DOCX/PPTX/XLSX) lalu tekan **Send**."
+                )
+                return
+
+        # B) Heartbeat & entry menu
+        if text.lower() in ("ping",):
             await turn_context.send_activity("pong")
             return
+        if text.lower() in ("hi", "halo", "translate", "start", "menu", "help", "/help"):
+            await self._send_menu_card(turn_context)
+            return
 
-        # ---- Dokumen ----
+        # C) Dokumen
         if turn_context.activity.attachments:
+            pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
             try:
-                await self._handle_attachments(turn_context)  # default target: en
+                await self._handle_attachments(turn_context, to_lang=(pref.get("to_lang") or "en"))
             except Exception as e:
                 logging.exception("handle_attachments failed")
                 await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
             return
 
-        # ---- Teks ----
+        # D) Teks
         from_lang, to_lang, content = self._parse_direction(text)
+        # Jika user tidak tulis arah, gunakan preferensi
+        pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
+        if to_lang is None:
+            to_lang = pref.get("to_lang") or "en"
+        if from_lang is None:
+            from_lang = pref.get("from_lang")  # None → auto-detect
+
         if not content:
-            await turn_context.send_activity(
-                "Format: `id->en Selamat pagi` atau ketik kalimat (default id->en)."
-            )
+            await self._send_menu_card(turn_context)
             return
 
         if len(content) > MAX_TEXT_LEN:
-            await turn_context.send_activity(
-                f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter."
-            )
+            await turn_context.send_activity(f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter.")
             return
 
         if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
             await turn_context.send_activity("Translator (text) belum dikonfigurasi di server.")
             return
 
-        # GLOBAL endpoint → /translate?api-version=3.0
         url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
         if from_lang:
             url += f"&from={from_lang}"
@@ -119,7 +164,70 @@ class TranslatorBot(ActivityHandler):
             logging.exception("translate-text failed")
             await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
-    # ---------- Helper: parse 'xx->yy kalimat' ----------
+    # ---------- MENU CARD ----------
+    async def _send_menu_card(self, turn_context: TurnContext):
+        card = {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.5",
+            "body": [
+                {"type": "TextBlock", "text": "KID AI Translator", "weight": "Bolder", "size": "Large"},
+                {"type": "TextBlock", "text": "Translate documents + Chat with AI", "spacing": "Small"},
+                {"type": "TextBlock", "text": "Attach a file to translate, or choose an option below.", "isSubtle": True, "spacing": "Small"}
+            ],
+            "actions": [
+                {"type": "Action.Submit", "title": "📄 Translate document", "data": {"type": "menu", "action": "translate_document"}},
+                {"type": "Action.Submit", "title": "ℹ️ How to upload", "data": {"type": "menu", "action": "how_to_upload"}}
+            ]
+        }
+        await turn_context.send_activity({"type": "message", "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": card
+        }]})
+
+    # ---------- HOW TO UPLOAD ----------
+    async def _send_howto(self, turn_context: TurnContext):
+        steps = (
+            "Cara upload dokumen:\n"
+            "1) Klik ikon **Attach (+)** → **Upload from this device** (jangan pilih _Attach cloud files_).\n"
+            "2) Pilih file **PDF/DOCX/PPTX/XLSX**, lalu tekan **Send**.\n"
+            "3) Tunggu 10–60 detik, hasil akan muncul sebagai **file** di chat.\n"
+            "Tip: ketik `translate` untuk memilih bahasa tujuan."
+        )
+        await turn_context.send_activity(steps)
+
+    # ---------- Adaptive Card: pilih bahasa ----------
+    async def _send_language_card(self, turn_context: TurnContext, user_id: str):
+        pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
+        dst_default = pref.get("to_lang") or "en"
+        src_default = pref.get("from_lang") or "auto"
+
+        choices_json = [{"title": label, "value": code} for (label, code) in LANG_CHOICES]
+        src_choices = [{"title": "Auto detect", "value": "auto"}] + choices_json
+
+        card = {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.5",
+            "body": [
+                {"type": "TextBlock", "text": "Pilih bahasa", "weight": "Bolder", "size": "Medium"},
+                {"type": "TextBlock", "text": "Sumber", "spacing": "Small"},
+                {"type": "Input.ChoiceSet", "id": "src_lang", "style": "compact", "value": src_default, "choices": src_choices},
+                {"type": "TextBlock", "text": "Tujuan", "spacing": "Small"},
+                {"type": "Input.ChoiceSet", "id": "dst_lang", "style": "compact", "value": dst_default, "choices": choices_json},
+                {"type": "TextBlock", "text": "Setelah Start, kirim teks atau unggah file (PDF/DOCX/PPTX/XLSX).", "isSubtle": True, "spacing": "Small"}
+            ],
+            "actions": [
+                {"type": "Action.Submit", "title": "Start", "data": {"type": "set_lang"}}
+            ]
+        }
+
+        await turn_context.send_activity({"type": "message", "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": card
+        }]})
+
+    # ---------- Parser arah 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
         default_to = "en"
         if not text:
@@ -131,13 +239,26 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
+    # ---------- Util: Teams File Download Card ----------
+    def _teams_file_download_card(self, file_name: str, download_url: str, unique_id: str):
+        ext = file_name.split(".")[-1].lower() if "." in file_name else "bin"
+        return {
+            "contentType": "application/vnd.microsoft.teams.file.download.info",
+            "content": {
+                "downloadUrl": download_url,
+                "uniqueId": unique_id,
+                "fileType": ext
+            },
+            "name": file_name
+        }
+
     # ---------- Dokumen ----------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
-        # 0) Endpoint batch harus endpoint resource
+        # Validasi endpoint/keys
         if (not DOC_TRANSLATION_ENDPOINT) or ("cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT):
             await turn_context.send_activity(
-                "Konfigurasi belum lengkap: `DOC_TRANSLATION_ENDPOINT` harus diisi "
-                "dengan endpoint **resource** Translator, contoh: `https://<nama-resource>.cognitiveservices.azure.com`."
+                "Konfigurasi belum lengkap: `DOC_TRANSLATION_ENDPOINT` harus endpoint **resource** Translator, contoh: "
+                "`https://<nama-resource>.cognitiveservices.azure.com`."
             )
             return
         if not DOC_TRANSLATION_KEY:
@@ -151,7 +272,7 @@ class TranslatorBot(ActivityHandler):
         att_content = getattr(att, "content", None)
         logging.info(f"[att] name={name} type={att_type} url={content_url}")
 
-        # 1) Pilih URL unduh yang benar
+        # 1) Pilih URL unduh
         download_url = None
         if isinstance(att_content, dict) and att_content.get("downloadUrl"):
             download_url = att_content.get("downloadUrl")
@@ -164,7 +285,7 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity("Lampiran tidak memiliki URL unduh yang valid.")
             return
 
-        # 2) Unduh file (tanpa auth → fallback Bearer token bot)
+        # 2) Unduh bytes (tanpa auth → fallback Bearer token bot)
         try:
             file_bytes = None
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -198,14 +319,12 @@ class TranslatorBot(ActivityHandler):
 
         job_id = str(uuid.uuid4())
         src_blob_name = f"{job_id}/{name}"
-        bs.get_blob_client(container=STORAGE_CONTAINER_SOURCE, blob=src_blob_name).upload_blob(
-            file_bytes, overwrite=True
-        )
+        bs.get_blob_client(container=STORAGE_CONTAINER_SOURCE, blob=src_blob_name).upload_blob(file_bytes, overwrite=True)
 
-        # 4) SAS CONTAINER (source) + filter.prefix & FOLDER (target) — Expire 4 jam.
+        # 4) SAS: Source=CONTAINER + filter.prefix, Target=FOLDER path (before ?)
         expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
 
-        # SOURCE = CONTAINER SAS (read + list)
+        # Source CONTAINER SAS: read + list
         sas_src_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
@@ -215,7 +334,7 @@ class TranslatorBot(ActivityHandler):
         )
         source_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}?{sas_src_container}"
 
-        # TARGET = FOLDER path sebelum ? + CONTAINER SAS izin w+a+c+l(+r)
+        # Target folder SAS (path sebelum ?), izin w+a+c+l(+r)
         sas_tgt_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
@@ -225,13 +344,12 @@ class TranslatorBot(ActivityHandler):
         )
         target_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_tgt_container}"
 
-        # ---- DEBUG LOG SAS (TER-MASKING) ----
+        # Debug log (masked) — hapus setelah stabil
         logging.warning(f"[DEBUG-SAS] SOURCE_CONTAINER_URL = {_mask_sas(source_container_url)}")
         logging.warning(f"[DEBUG-SAS] TARGET_URL          = {_mask_sas(target_url)}")
         logging.warning(f"[DEBUG-SAS] FILTER_PREFIX       = {job_id}/")
-        # -------------------------------------
 
-        # 5) Submit batch (source=container + filter.prefix, target=folder path)
+        # 5) Submit Document Translation
         batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": DOC_TRANSLATION_KEY,
@@ -239,14 +357,8 @@ class TranslatorBot(ActivityHandler):
         }
         payload = {
             "inputs": [{
-                "source": {
-                    "sourceUrl": source_container_url,
-                    "filter": { "prefix": f"{job_id}/" }
-                },
-                "targets": [{
-                    "targetUrl": target_url,
-                    "language": to_lang
-                }]
+                "source": { "sourceUrl": source_container_url, "filter": { "prefix": f"{job_id}/" } },
+                "targets": [{ "targetUrl": target_url, "language": to_lang }]
             }]
         }
 
@@ -259,7 +371,7 @@ class TranslatorBot(ActivityHandler):
 
         await turn_context.send_activity(f"Job diterima untuk **{name}**. Menunggu hasil…")
 
-        # 6) Poll status + tampilkan DETAIL kalau gagal
+        # 6) Poll status + tampilkan DETAIL bila gagal
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 for _ in range(30):
@@ -270,7 +382,7 @@ class TranslatorBot(ActivityHandler):
                     await asyncio.sleep(3)
 
             if data.get("status") != "Succeeded":
-                # ---- tarik detail error dari job & per-dokumen
+                # Ambil detail error (job + per dokumen)
                 err_msg = None
                 try:
                     errs = data.get("errors") or []
@@ -300,25 +412,29 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(msg)
                 return
 
-            # 7) Kirim link hasil
+            # 7) Kirim hasil sebagai **Teams File Download Card** (bukan link mentah)
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
             if not blobs:
                 await turn_context.send_activity("Job selesai tapi file hasil tidak ditemukan.")
                 return
 
-            await turn_context.send_activity("Hasil terjemahan (link unduh berlaku 4 jam):")
+            await turn_context.send_activity("Hasil terjemahan:")
             for b in blobs:
+                # SAS read untuk blob hasil
                 sas_read_out = generate_blob_sas(
                     account_name=STORAGE_ACCOUNT_NAME,
                     container_name=STORAGE_CONTAINER_TARGET,
                     blob_name=b.name,
                     account_key=STORAGE_ACCOUNT_KEY,
                     permission=BlobSasPermissions(read=True),
-                    expiry=expiry
+                    expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=4)
                 )
-                url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
-                await turn_context.send_activity(url)
+                download_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
+                file_name = b.name.split("/", 1)[-1]  # buang prefix job_id/
+                file_card = self._teams_file_download_card(file_name, download_url, unique_id=b.name)
+
+                await turn_context.send_activity({"type": "message", "attachments": [file_card]})
 
         except Exception as e:
             logging.exception("document-translation polling failed")
