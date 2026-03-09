@@ -1,17 +1,17 @@
 from botbuilder.core import ActivityHandler, TurnContext
 import os, httpx, uuid, logging, asyncio, datetime
 
-# ===================== Translator (Text - GLOBAL) =====================
+# ============== Text Translation (GLOBAL endpoint) ==============
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
-# ===== Translator (Document Translation - RESOURCE endpoint AT COGNITIVESERVICES) =====
-# Contoh BENAR: https://<nama-resource>.cognitiveservices.azure.com
+# ============== Document Translation (RESOURCE endpoint) =========
+# Contoh: https://<nama-resource>.cognitiveservices.azure.com
 DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
 DOC_TRANSLATION_KEY      = os.getenv("DOC_TRANSLATION_KEY") or os.getenv("TRANSLATOR_KEY")
 
-# ===================== Storage (Blob) =====================
+# ============== Storage (Blob) ==================================
 from azure.storage.blob import (
     BlobServiceClient, generate_blob_sas, BlobSasPermissions,
     generate_container_sas, ContainerSasPermissions
@@ -21,11 +21,11 @@ STORAGE_ACCOUNT_KEY       = os.getenv("STORAGE_ACCOUNT_KEY")
 STORAGE_CONTAINER_SOURCE  = os.getenv("STORAGE_CONTAINER_SOURCE", "input")
 STORAGE_CONTAINER_TARGET  = os.getenv("STORAGE_CONTAINER_TARGET", "output")
 
-# ===================== Bot Credentials (for protected downloads) =====================
+# ============== Bot Credentials (protected downloads) ============
 try:
     from botframework.connector.auth import MicrosoftAppCredentials
 except Exception:
-    MicrosoftAppCredentials = None  # safety
+    MicrosoftAppCredentials = None
 MICROSOFT_APP_ID       = os.getenv("MicrosoftAppId")
 MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
 
@@ -34,8 +34,6 @@ MAX_TEXT_LEN = 5000
 
 
 class TranslatorBot(ActivityHandler):
-
-    # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         welcome = (
             "Halo! 👋 Saya **KID AI Translator**.\n"
@@ -45,25 +43,23 @@ class TranslatorBot(ActivityHandler):
         )
         await turn_context.send_activity(welcome)
 
-    # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
         text = (turn_context.activity.text or "").strip()
 
-        # Heartbeat
         if text.lower() == "ping":
             await turn_context.send_activity("pong")
             return
 
-        # ---- Document path ----
+        # ---- Dokumen ----
         if turn_context.activity.attachments:
             try:
-                await self._handle_attachments(turn_context)  # default target: en
+                await self._handle_attachments(turn_context)
             except Exception as e:
                 logging.exception("handle_attachments failed")
                 await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
             return
 
-        # ---- Text path ----
+        # ---- Teks ----
         from_lang, to_lang, content = self._parse_direction(text)
         if not content:
             await turn_context.send_activity(
@@ -72,23 +68,20 @@ class TranslatorBot(ActivityHandler):
             return
 
         if len(content) > MAX_TEXT_LEN:
-            await turn_context.send_activity(
-                f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter."
-            )
+            await turn_context.send_activity(f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter.")
             return
 
         if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
             await turn_context.send_activity("Translator (text) belum dikonfigurasi di server.")
             return
 
-        # GLOBAL endpoint → /translate?api-version=3.0
         url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
         if from_lang:
             url += f"&from={from_lang}"
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -106,12 +99,8 @@ class TranslatorBot(ActivityHandler):
             logging.exception("translate-text failed")
             await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
-    # ---------------------- Helper: parse 'xx->yy kalimat' ----------------------
+    # ---------- Helper: parse 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
-        """
-        Return (from_lang, to_lang, content).
-        Jika tidak ada 'xx->yy', from_lang=None (auto), to_lang='en'.
-        """
         default_to = "en"
         if not text:
             return None, default_to, ""
@@ -122,15 +111,17 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
-    # ---------------------- Document Translation Handler ----------------------
+    # ---------- Dokumen ----------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
-        # 0) Validasi endpoint batch (HARUS endpoint resource, bukan global)
+        # 0) Endpoint batch harus endpoint resource
         if (not DOC_TRANSLATION_ENDPOINT) or ("cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT):
             await turn_context.send_activity(
                 "Konfigurasi belum lengkap: `DOC_TRANSLATION_ENDPOINT` harus diisi "
-                "dengan endpoint **resource** Translator, contoh:\n"
-                "`https://<nama-resource>.cognitiveservices.azure.com`"
+                "dengan endpoint **resource** Translator, contoh: `https://<nama-resource>.cognitiveservices.azure.com`."
             )
+            return
+        if not DOC_TRANSLATION_KEY:
+            await turn_context.send_activity("`DOC_TRANSLATION_KEY` belum diisi.")
             return
 
         att = turn_context.activity.attachments[0]
@@ -138,12 +129,9 @@ class TranslatorBot(ActivityHandler):
         content_url = getattr(att, "content_url", "") or ""
         att_type = getattr(att, "content_type", "")
         att_content = getattr(att, "content", None)
-
         logging.info(f"[att] name={name} type={att_type} url={content_url}")
 
-        # 1) Tentukan URL unduh yang benar
-        #    - Jika ada content.downloadUrl (Teams File Download Info) → pakai itu
-        #    - Jika tidak, pakai attachment.content_url
+        # 1) Pilih URL unduh yang benar
         download_url = None
         if isinstance(att_content, dict) and att_content.get("downloadUrl"):
             download_url = att_content.get("downloadUrl")
@@ -156,9 +144,9 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity("Lampiran tidak memiliki URL unduh yang valid.")
             return
 
-        # 2) Download file → coba tanpa auth, bila gagal retry Bearer token bot
-        file_bytes = None
+        # 2) Unduh file (tanpa auth → fallback Bearer token bot)
         try:
+            file_bytes = None
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 r = await client.get(download_url)
                 if r.status_code == 200 and r.content:
@@ -183,75 +171,62 @@ class TranslatorBot(ActivityHandler):
         if not (STORAGE_ACCOUNT_NAME and STORAGE_ACCOUNT_KEY):
             await turn_context.send_activity("Storage belum dikonfigurasi di server.")
             return
-
         bs = BlobServiceClient(
             account_url=f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net",
             credential=STORAGE_ACCOUNT_KEY
         )
 
         job_id = str(uuid.uuid4())
-        src_blob_name = f"{job_id}/{name}"  # simpan di folder jobId
+        src_blob_name = f"{job_id}/{name}"
         bs.get_blob_client(container=STORAGE_CONTAINER_SOURCE, blob=src_blob_name).upload_blob(
             file_bytes, overwrite=True
         )
 
-        # 4) Buat SAS FOLDER (PERHATIKAN: path dahulu, kemudian ?sas)
-        #    Source: https://.../input/<jobId>?<sas (read+list)>
-        #    Target: https://.../output/<jobId>?<sas (write+add+create+list)>
-        sas_read_container = generate_container_sas(
+        # 4) SAS folder (path dulu, lalu ?sas). Expire 4 jam.
+        expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
+
+        sas_src = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
             account_key=STORAGE_ACCOUNT_KEY,
             permission=ContainerSasPermissions(read=True, list=True),
-            expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+            expiry=expiry
         )
-        source_url = (
-            f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
-            f"{STORAGE_CONTAINER_SOURCE}/{job_id}?{sas_read_container}"
-        )
+        source_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}/{job_id}?{sas_src}"
 
-        sas_write_container = generate_container_sas(
+        sas_tgt = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
             account_key=STORAGE_ACCOUNT_KEY,
-            permission=ContainerSasPermissions(write=True, add=True, create=True, list=True),
-            expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+            # tambahkan read juga (beberapa validasi melakukan probe)
+            permission=ContainerSasPermissions(write=True, add=True, create=True, list=True, read=True),
+            expiry=expiry
         )
-        target_url = (
-            f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
-            f"{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_write_container}"
-        )
+        target_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_tgt}"
 
-        # 5) Submit Document Translation (Batch API) — gunakan ENDPOINT RESOURCE
-        if not DOC_TRANSLATION_KEY:
-            await turn_context.send_activity("`DOC_TRANSLATION_KEY` belum diisi.")
-            return
-
-        batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"  # v1.0 lebih kompatibel
+        # 5) Submit batch (endpoint resource + key resource)
+        batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": DOC_TRANSLATION_KEY,
-            # Untuk endpoint resource, header region tidak wajib
             "Content-Type": "application/json"
         }
         payload = {
             "inputs": [{
-                "source": {"sourceUrl": source_url},
-                "targets": [{ "targetUrl": target_url, "language": to_lang }]
+                "source":  {"sourceUrl": source_url},
+                "targets": [{"targetUrl": target_url, "language": to_lang}]
             }]
         }
 
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(batch_url, headers=headers, json=payload)
             if r.status_code not in (201, 202):
-                await turn_context.send_activity(
-                    f"Submit job gagal {r.status_code}: {r.text[:400]}"
-                )
+                await turn_context.send_activity(f"Submit job gagal {r.status_code}: {r.text[:400]}")
                 return
             status_url = r.headers.get("Operation-Location") or r.headers.get("Location")
 
         await turn_context.send_activity(f"Job diterima untuk **{name}**. Menunggu hasil…")
 
-        # 6) Poll status hingga selesai (~90 detik)
+        # 6) Poll status
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 for _ in range(30):
@@ -262,7 +237,7 @@ class TranslatorBot(ActivityHandler):
                     await asyncio.sleep(3)
 
             if data.get("status") != "Succeeded":
-                # Tarik detail error ringkas dari job & per dokumen
+                # tarik detail error dari job & per-dokumen
                 err_msg = None
                 try:
                     errs = data.get("errors") or []
@@ -279,10 +254,7 @@ class TranslatorBot(ActivityHandler):
                             for it in (dj.get('value') or []) if it.get('status') not in ('Succeeded', 'Running')
                         ]
                         if failed:
-                            if err_msg:
-                                err_msg += " || " + " ; ".join(failed[:2])
-                            else:
-                                err_msg = " ; ".join(failed[:2])
+                            err_msg = (err_msg + " || " if err_msg else "") + " ; ".join(failed[:2])
                 except Exception:
                     pass
 
@@ -292,14 +264,14 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(msg)
                 return
 
-            # 7) Enumerasi hasil di output/<jobId>/
+            # 7) Kirim link hasil
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
             if not blobs:
                 await turn_context.send_activity("Job selesai tapi file hasil tidak ditemukan.")
                 return
 
-            await turn_context.send_activity("Hasil terjemahan (link unduh berlaku 2 jam):")
+            await turn_context.send_activity("Hasil terjemahan (link unduh berlaku 4 jam):")
             for b in blobs:
                 sas_read_out = generate_blob_sas(
                     account_name=STORAGE_ACCOUNT_NAME,
@@ -307,12 +279,9 @@ class TranslatorBot(ActivityHandler):
                     blob_name=b.name,
                     account_key=STORAGE_ACCOUNT_KEY,
                     permission=BlobSasPermissions(read=True),
-                    expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+                    expiry=expiry
                 )
-                url = (
-                    f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
-                    f"{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
-                )
+                url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
                 await turn_context.send_activity(url)
 
         except Exception as e:
