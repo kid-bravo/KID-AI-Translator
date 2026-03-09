@@ -1,4 +1,5 @@
 from botbuilder.core import ActivityHandler, TurnContext
+from botbuilder.schema import Attachment, Activity
 import os, httpx, uuid, logging, asyncio, datetime, json
 from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
@@ -34,8 +35,7 @@ logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
 
 # ===================== Preferensi bahasa (in-memory) ==================
-# SESSIONS[user_id] = {"from_lang": None|"id"|..., "to_lang": "en"|...}
-SESSIONS = {}
+SESSIONS = {}  # SESSIONS[user_id] = {"from_lang": None|"id"|..., "to_lang": "en"|...}
 
 # ===================== Daftar bahasa di Card ==========================
 LANG_CHOICES = [
@@ -70,6 +70,7 @@ def _mask_sas(url: str) -> str:
 
 
 class TranslatorBot(ActivityHandler):
+
     # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         await self._send_menu_card(turn_context)
@@ -180,10 +181,12 @@ class TranslatorBot(ActivityHandler):
                 {"type": "Action.Submit", "title": "ℹ️ How to upload", "data": {"type": "menu", "action": "how_to_upload"}}
             ]
         }
-        await turn_context.send_activity({"type": "message", "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": card
-        }]})
+        attachment = Attachment(
+            content_type="application/vnd.microsoft.card.adaptive",
+            content=card
+        )
+        activity = Activity(type="message", attachments=[attachment])
+        await turn_context.send_activity(activity)
 
     # ---------- HOW TO UPLOAD ----------
     async def _send_howto(self, turn_context: TurnContext):
@@ -203,7 +206,7 @@ class TranslatorBot(ActivityHandler):
         src_default = pref.get("from_lang") or "auto"
 
         choices_json = [{"title": label, "value": code} for (label, code) in LANG_CHOICES]
-        src_choices = [{"title": "Auto detect", "value": "auto"}] + choices_json
+        src_choices   = [{"title": "Auto detect", "value": "auto"}] + choices_json
 
         card = {
             "type": "AdaptiveCard",
@@ -221,11 +224,12 @@ class TranslatorBot(ActivityHandler):
                 {"type": "Action.Submit", "title": "Start", "data": {"type": "set_lang"}}
             ]
         }
-
-        await turn_context.send_activity({"type": "message", "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": card
-        }]})
+        attachment = Attachment(
+            content_type="application/vnd.microsoft.card.adaptive",
+            content=card
+        )
+        activity = Activity(type="message", attachments=[attachment])
+        await turn_context.send_activity(activity)
 
     # ---------- Parser arah 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
@@ -242,15 +246,15 @@ class TranslatorBot(ActivityHandler):
     # ---------- Util: Teams File Download Card ----------
     def _teams_file_download_card(self, file_name: str, download_url: str, unique_id: str):
         ext = file_name.split(".")[-1].lower() if "." in file_name else "bin"
-        return {
-            "contentType": "application/vnd.microsoft.teams.file.download.info",
-            "content": {
+        return Attachment(
+            content_type="application/vnd.microsoft.teams.file.download.info",
+            content={
                 "downloadUrl": download_url,
                 "uniqueId": unique_id,
                 "fileType": ext
             },
-            "name": file_name
-        }
+            name=file_name
+        )
 
     # ---------- Dokumen ----------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
@@ -412,7 +416,7 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(msg)
                 return
 
-            # 7) Kirim hasil sebagai **Teams File Download Card** (bukan link mentah)
+            # 7) Kirim hasil sebagai **Teams File Download Card** (file bubble)
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
             if not blobs:
@@ -434,7 +438,7 @@ class TranslatorBot(ActivityHandler):
                 file_name = b.name.split("/", 1)[-1]  # buang prefix job_id/
                 file_card = self._teams_file_download_card(file_name, download_url, unique_id=b.name)
 
-                await turn_context.send_activity({"type": "message", "attachments": [file_card]})
+                await turn_context.send_activity(Activity(type="message", attachments=[file_card]))
 
         except Exception as e:
             logging.exception("document-translation polling failed")
