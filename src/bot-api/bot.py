@@ -16,9 +16,8 @@ STORAGE_ACCOUNT_KEY       = os.getenv("STORAGE_ACCOUNT_KEY")
 STORAGE_CONTAINER_SOURCE  = os.getenv("STORAGE_CONTAINER_SOURCE", "input")
 STORAGE_CONTAINER_TARGET  = os.getenv("STORAGE_CONTAINER_TARGET", "output")
 
-# ====== Ambil kredensial bot untuk access token (untuk unduh konten Teams yang protected) ======
+# ====== Kredensial Bot (untuk unduh lampiran protected) ======
 from botframework.connector.auth import MicrosoftAppCredentials
-
 MICROSOFT_APP_ID       = os.getenv("MicrosoftAppId")
 MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword")
 
@@ -117,29 +116,43 @@ class TranslatorBot(ActivityHandler):
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
         att = turn_context.activity.attachments[0]
         name = att.name or f"file-{uuid.uuid4()}"
-        content_url = att.content_url or ""
+        content_url = getattr(att, "content_url", "") or ""
+        att_type = getattr(att, "content_type", "")
+        att_content = getattr(att, "content", None)
 
-        logging.info(f"[att] name={att.name} type={att.content_type} url={content_url}")
+        logging.info(f"[att] name={name} type={att_type} url={content_url}")
 
-        # 1) Download file dari Teams
+        # 1) Tentukan URL unduh yang benar:
+        #    - Jika ada content.downloadUrl (Teams File Download Info) → pakai itu
+        #    - Jika tidak, pakai attachment.content_url
+        download_url = None
+        if isinstance(att_content, dict) and att_content.get("downloadUrl"):
+            download_url = att_content.get("downloadUrl")
+            logging.info(f"[att] gunakan content.downloadUrl: {download_url}")
+        else:
+            download_url = content_url
+            logging.info(f"[att] gunakan attachment.content_url: {download_url}")
+
+        if not download_url:
+            await turn_context.send_activity("Lampiran tidak memiliki URL unduh yang valid.")
+            return
+
+        # 2) Download file → coba tanpa auth dulu, bila gagal, retry dengan Bearer token bot
         file_bytes = None
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                # Percobaan 1: tanpa auth
-                r = await client.get(content_url)
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                r = await client.get(download_url)
                 if r.status_code == 200 and r.content:
                     file_bytes = r.content
                 else:
-                    # Percobaan 2: pakai Bearer token connector (bot credentials)
                     if not (MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD):
                         raise Exception(f"contentUrl protected ({r.status_code}) dan bot tidak punya kredensial.")
-
                     creds = MicrosoftAppCredentials(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
                     token = await creds.get_access_token()
-                    r2 = await client.get(content_url, headers={"Authorization": f"Bearer {token}"})
+                    r2 = await client.get(download_url, headers={"Authorization": f"Bearer {token}"})
                     r2.raise_for_status()
                     file_bytes = r2.content
-        except Exception as e:
+        except Exception:
             logging.exception("download attachment failed")
             await turn_context.send_activity(
                 "Gagal mengunduh file dari Teams. Coba drag-&-drop dari perangkat. "
@@ -147,7 +160,7 @@ class TranslatorBot(ActivityHandler):
             )
             return
 
-        # 2) Upload ke Blob input/
+        # 3) Upload ke Blob input/
         if not (STORAGE_ACCOUNT_NAME and STORAGE_ACCOUNT_KEY):
             await turn_context.send_activity("Storage belum dikonfigurasi di server.")
             return
@@ -162,7 +175,7 @@ class TranslatorBot(ActivityHandler):
             file_bytes, overwrite=True
         )
 
-        # 3) SAS read untuk input blob
+        # 4) SAS read untuk input blob
         sas_read = generate_blob_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
@@ -176,7 +189,7 @@ class TranslatorBot(ActivityHandler):
             f"{STORAGE_CONTAINER_SOURCE}/{blob_name}?{sas_read}"
         )
 
-        # 4) SAS write untuk output container (folder = job_id)
+        # 5) SAS write untuk output container (folder = job_id)
         job_id = str(uuid.uuid4())
         sas_write = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
@@ -190,7 +203,7 @@ class TranslatorBot(ActivityHandler):
             f"{STORAGE_CONTAINER_TARGET}?{sas_write}"
         )
 
-        # 5) Submit Document Translation (Batch API)
+        # 6) Submit Document Translation (Batch API)
         if not (TRANSLATOR_ENDPOINT and TRANSLATOR_KEY):
             await turn_context.send_activity("Translator belum dikonfigurasi di server.")
             return
@@ -220,7 +233,7 @@ class TranslatorBot(ActivityHandler):
 
         await turn_context.send_activity(f"Job diterima untuk **{name}**. Menunggu hasil…")
 
-        # 6) Poll status hingga selesai (~90 detik)
+        # 7) Poll status hingga selesai (~90 detik)
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 for _ in range(30):
@@ -234,7 +247,7 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(f"Job gagal/berhenti. Status: **{data.get('status')}**")
                 return
 
-            # 7) Enumerasi hasil di output/<job_id>/
+            # 8) Enumerasi hasil di output/<job_id>/
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
 
