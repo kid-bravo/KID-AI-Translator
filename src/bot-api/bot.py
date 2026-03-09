@@ -6,7 +6,7 @@ TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
-# ====== Storage (untuk Document Translation MVP) ======
+# ====== Storage (untuk Document Translation) ======
 from azure.storage.blob import (
     BlobServiceClient, generate_blob_sas, BlobSasPermissions,
     generate_container_sas, ContainerSasPermissions
@@ -17,7 +17,6 @@ STORAGE_CONTAINER_SOURCE  = os.getenv("STORAGE_CONTAINER_SOURCE", "input")
 STORAGE_CONTAINER_TARGET  = os.getenv("STORAGE_CONTAINER_TARGET", "output")
 
 logging.basicConfig(level=logging.INFO)
-
 MAX_TEXT_LEN = 5000
 
 
@@ -25,30 +24,31 @@ class TranslatorBot(ActivityHandler):
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         welcome = (
             "Halo! 👋 Saya AI Translator.\n"
-            "Contoh: `id->en Selamat pagi` atau `ja->id おはようございます`.\n"
-            "Jika tidak menulis arah, default `id->en`.\n"
-            "Kirim *file* (PDF/DOCX/PPTX/XLSX) untuk terjemah dokumen."
+            "• Teks: `id->en Selamat pagi` atau ketik kalimat (default id->en)\n"
+            "• Dokumen: unggah PDF/DOCX/PPTX/XLSX ke chat ini\n"
+            "Ketik `ping` untuk uji sambungan."
         )
         await turn_context.send_activity(welcome)
 
     async def on_message_activity(self, turn_context: TurnContext):
         text = (turn_context.activity.text or "").strip()
 
-        # Heartbeat — untuk cek cepat jalur pesan
+        # Heartbeat — cek jalur pesan
         if text.lower() == "ping":
             await turn_context.send_activity("pong")
             return
 
-        # ====== Jika ada lampiran: jalankan alur Document Translation ======
+        # ===== 5.1: panggil handler dokumen saat ada lampiran =====
         if turn_context.activity.attachments:
             try:
-                await self._handle_attachments(turn_context)
+                await self._handle_attachments(turn_context)  # default target: en
             except Exception as e:
                 logging.exception("handle_attachments failed")
                 await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
             return
+        # ==========================================================
 
-        # ====== Alur TEKS ======
+        # ===== Alur TEKS =====
         from_lang, to_lang, content = self._parse_direction(text)
 
         if not content:
@@ -92,11 +92,11 @@ class TranslatorBot(ActivityHandler):
             logging.exception("translate-text failed")
             await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
-    # ====== Parser arah 'xx->yy kalimat' ======
+    # ===== Parser arah 'xx->yy kalimat' =====
     def _parse_direction(self, text: str):
         """
-        Mengembalikan (from_lang, to_lang, content).
-        Jika tidak ada 'xx->yy', from_lang=None (auto detect), to_lang='en'.
+        Return (from_lang, to_lang, content).
+        Jika tidak ada 'xx->yy', from_lang=None (auto), to_lang='en'.
         """
         default_to = "en"
         if not text:
@@ -108,20 +108,20 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
-    # ====== Document Translation MVP (pakai SAS link hasil) ======
+    # ===== 5.2: Document Translation handler =====
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
         att = turn_context.activity.attachments[0]
         name = att.name or f"file-{uuid.uuid4()}"
         content_url = att.content_url
 
-        # 1) Download file dari Teams
+        # 1) Download file dari Teams (drag&drop biasanya langsung GET)
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 res = await client.get(content_url)
                 res.raise_for_status()
                 file_bytes = res.content
         except Exception:
-            await turn_context.send_activity("Gagal mengunduh file dari Teams. Coba drag-&-drop file langsung (bukan link).")
+            await turn_context.send_activity("Gagal mengunduh file dari Teams. Coba drag-&-drop (bukan link).")
             return
 
         # 2) Upload ke Blob input/
@@ -153,7 +153,7 @@ class TranslatorBot(ActivityHandler):
             f"{STORAGE_CONTAINER_SOURCE}/{blob_name}?{sas_read}"
         )
 
-        # 4) SAS write untuk output container + folder jobId
+        # 4) SAS write untuk output container (folder = job_id)
         job_id = str(uuid.uuid4())
         sas_write = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
@@ -167,7 +167,7 @@ class TranslatorBot(ActivityHandler):
             f"{STORAGE_CONTAINER_TARGET}?{sas_write}"
         )
 
-        # 5) Submit Document Translation Batch API
+        # 5) Submit Document Translation (Batch API)
         if not (TRANSLATOR_ENDPOINT and TRANSLATOR_KEY):
             await turn_context.send_activity("Translator belum dikonfigurasi di server.")
             return
@@ -197,10 +197,10 @@ class TranslatorBot(ActivityHandler):
 
         await turn_context.send_activity(f"Job diterima untuk **{name}**. Menunggu hasil…")
 
-        # 6) Poll status hingga selesai
+        # 6) Poll status hingga selesai (~90 detik)
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                for _ in range(30):  # ~90 detik
+                for _ in range(30):
                     s = await client.get(status_url, headers=headers)
                     data = s.json()
                     if data.get("status") in ("Succeeded", "Failed", "Cancelled"):
@@ -211,7 +211,7 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(f"Job gagal/berhenti. Status: **{data.get('status')}**")
                 return
 
-            # 7) Ambil daftar hasil di output/<job_id>/
+            # 7) Enumerasi hasil di output/<job_id>/
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
 
