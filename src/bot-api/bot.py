@@ -1,104 +1,115 @@
-from botbuilder.core import ActivityHandler, TurnContext
-import os, httpx, uuid, logging, asyncio
+async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
+    att = turn_context.activity.attachments[0]
+    name = att.name or f"file-{uuid.uuid4()}"
+    content_url = att.content_url
 
-# Endpoint GLOBAL (api.cognitive.microsofttranslator.com)
-TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
-TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
-TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
+    # 1) Download file
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            res = await client.get(content_url)
+            res.raise_for_status()
+            file_bytes = res.content
+    except Exception:
+        await turn_context.send_activity("Gagal mengunduh file dari Teams. Coba drag-&-drop, bukan link.")
+        return
 
-logging.basicConfig(level=logging.INFO)
+    # 2) Upload ke blob input/
+    bs = BlobServiceClient(
+        account_url=f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net",
+        credential=STORAGE_ACCOUNT_KEY
+    )
+    blob_name = f"{uuid.uuid4()}-{name}"
+    bs.get_blob_client(container=STORAGE_CONTAINER_SOURCE, blob=blob_name).upload_blob(
+        file_bytes, overwrite=True
+    )
 
-MAX_LEN = 5000
+    # 3) SAS read untuk input/
+    sas_read = generate_blob_sas(
+        account_name=STORAGE_ACCOUNT_NAME,
+        container_name=STORAGE_CONTAINER_SOURCE,
+        blob_name=blob_name,
+        account_key=STORAGE_ACCOUNT_KEY,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    )
+    source_sas_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}/{blob_name}?{sas_read}"
 
-class TranslatorBot(ActivityHandler):
-    async def on_members_added_activity(self, members_added, turn_context: TurnContext):
-        welcome = (
-            "Halo! 👋 Saya AI Translator.\n"
-            "Contoh: `id->en Selamat pagi` atau `ja->id おはようございます`\n"
-            "Kalau tidak menulis arah, default `id->en`.\n"
-            "Ketik `help` untuk petunjuk."
-        )
-        await turn_context.send_activity(welcome)
+    # 4) SAS write untuk output/<jobId>/
+    job_id = str(uuid.uuid4())
+    sas_write = generate_container_sas(
+        account_name=STORAGE_ACCOUNT_NAME,
+        container_name=STORAGE_CONTAINER_TARGET,
+        account_key=STORAGE_ACCOUNT_KEY,
+        permission=ContainerSasPermissions(write=True, add=True, create=True, list=True),
+        expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    )
+    target_sas_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}?{sas_write}"
 
-    async def on_message_activity(self, turn_context: TurnContext):
-        text = (turn_context.activity.text or "").strip()
-        logging.info(f"[bot] pesan: {text!r}")
+    # 5) Submit Document Translation batch
+    batch_url = f"{TRANSLATOR_ENDPOINT}/translator/text/batch/v1.1/batches"
+    headers = {
+        "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
+        "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": [{
+            "source": {"sourceUrl": source_sas_url},
+            "targets": [{
+                "targetUrl": f"{target_sas_url}/{job_id}",
+                "language": to_lang
+            }]
+        }]
+    }
 
-        # Help
-        if text.lower() in ("help", "/help", "?"):
-            await turn_context.send_activity(
-                "Format:\n• `xx->yy kalimat` (contoh: `id->en Selamat pagi`)\n"
-                "• Jika tanpa arah, diasumsikan `id->en`.\n"
-                "Batas: 5000 karakter per pesan."
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(batch_url, headers=headers, json=payload)
+        if r.status_code not in (201, 202):
+            await turn_context.send_activity(f"Gagal submit job: {r.status_code}")
+            return
+        status_url = r.headers.get("Operation-Location")
+
+    await turn_context.send_activity(f"Job diterima untuk {name}. Menunggu hasil…")
+
+    # 6) Poll sampai selesai
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for _ in range(30):
+                s = await client.get(status_url, headers=headers)
+                data = s.json()
+                if data.get("status") in ("Succeeded", "Failed", "Cancelled"):
+                    break
+                await asyncio.sleep(3)
+
+        if data.get("status") != "Succeeded":
+            await turn_context.send_activity(f"Status job: {data.get('status')}")
+            return
+
+        # 7) Cari hasil di output/jobId/
+        cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
+        blobs = [b for b in cc.list_blobs(name_starts_with=f"{job_id}/")]
+
+        if not blobs:
+            await turn_context.send_activity("Job selesai tapi hasil tidak ditemukan.")
+            return
+
+        await turn_context.send_activity("Hasil terjemahan:")
+
+        # kirim semua file hasil
+        for b in blobs:
+            sas_read_out = generate_blob_sas(
+                account_name=STORAGE_ACCOUNT_NAME,
+                container_name=STORAGE_CONTAINER_TARGET,
+                blob_name=b.name,
+                account_key=STORAGE_ACCOUNT_KEY,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
             )
-            return
-
-        # Parsing arah
-        from_lang, to_lang, content = self._parse_direction(text)
-
-        if not content:
-            await turn_context.send_activity(
-                "Format: `id->en Selamat pagi` atau ketik kalimat langsung (default id->en)."
+            url = (
+                f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
+                f"{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
             )
-            return
+            await turn_context.send_activity(url)
 
-        if len(content) > MAX_LEN:
-            await turn_context.send_activity(
-                f"Teks terlalu panjang ({len(content)}). Batas {MAX_LEN} karakter."
-            )
-            return
-
-        if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
-            await turn_context.send_activity("Translator belum dikonfigurasi di server.")
-            return
-
-        # Translator (endpoint global → /translate?api-version=3.0)
-        url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
-        if from_lang:
-            url += f"&from={from_lang}"
-
-        headers = {
-            "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib untuk global
-            "Content-type": "application/json",
-            "X-ClientTraceId": str(uuid.uuid4())
-        }
-
-        payload = [{"Text": content}]
-        try:
-            data = await self._post_with_retry(url, headers, payload)
-            translated = data[0]["translations"][0]["text"]
-            await turn_context.send_activity(translated)
-        except httpx.HTTPStatusError as he:
-            msg = f"Translator error {he.response.status_code}: {he.response.text[:300]}"
-            logging.warning(f"[bot] {msg}")
-            await turn_context.send_activity(msg)
-        except Exception as e:
-            logging.exception(f"[bot] gagal memanggil Translator: {e}")
-            await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
-
-    def _parse_direction(self, text: str):
-        """
-        Pola: 'xx->yy kalimat'. Jika tidak ada, auto-detect source (None), target=en.
-        """
-        default_to = "en"
-        if not text:
-            return None, default_to, ""
-        parts = text.split(" ")
-        first = parts[0]
-        if "->" in first and len(parts) > 1:
-            a, b = first.split("->", 1)
-            return a.lower(), b.lower(), " ".join(parts[1:])
-        return None, default_to, text
-
-    async def _post_with_retry(self, url, headers, payload, attempts: int = 3):
-        backoff = 0.7
-        async with httpx.AsyncClient(timeout=15) as client:
-            for i in range(1, attempts + 1):
-                resp = await client.post(url, json=payload, headers=headers)
-                if resp.status_code in (429, 500, 502, 503, 504) and i < attempts:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                    continue
-                resp.raise_for_status()
-                return resp.json()
+    except Exception as e:
+        await turn_context.send_activity(f"Error: {e}")
