@@ -7,8 +7,9 @@ TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
 # ===== Translator (Document Translation - RESOURCE endpoint AT COGNITIVESERVICES) =====
-# Contoh BENAR: https://kid-translator-res.cognitiveservices.azure.com
+# Contoh BENAR: https://<nama-resource>.cognitiveservices.azure.com
 DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
+DOC_TRANSLATION_KEY      = os.getenv("DOC_TRANSLATION_KEY") or os.getenv("TRANSLATOR_KEY")
 
 # ===================== Storage (Blob) =====================
 from azure.storage.blob import (
@@ -123,8 +124,8 @@ class TranslatorBot(ActivityHandler):
 
     # ---------------------- Document Translation Handler ----------------------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
-        # 0) Validasi endpoint batch (harus endpoint resource, bukan global)
-        if not DOC_TRANSLATION_ENDPOINT or "cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT:
+        # 0) Validasi endpoint batch (HARUS endpoint resource, bukan global)
+        if (not DOC_TRANSLATION_ENDPOINT) or ("cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT):
             await turn_context.send_activity(
                 "Konfigurasi belum lengkap: `DOC_TRANSLATION_ENDPOINT` harus diisi "
                 "dengan endpoint **resource** Translator, contoh:\n"
@@ -222,10 +223,14 @@ class TranslatorBot(ActivityHandler):
         )
 
         # 5) Submit Document Translation (Batch API) — gunakan ENDPOINT RESOURCE
-        batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.1/batches"
+        if not DOC_TRANSLATION_KEY:
+            await turn_context.send_activity("`DOC_TRANSLATION_KEY` belum diisi.")
+            return
+
+        batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"  # v1.0 lebih kompatibel
         headers = {
-            "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
+            "Ocp-Apim-Subscription-Key": DOC_TRANSLATION_KEY,
+            # Untuk endpoint resource, header region tidak wajib
             "Content-Type": "application/json"
         }
         payload = {
@@ -257,27 +262,27 @@ class TranslatorBot(ActivityHandler):
                     await asyncio.sleep(3)
 
             if data.get("status") != "Succeeded":
-                # Tarik detail error ringkas dari job & per dokumen (supaya tahu penyebab)
+                # Tarik detail error ringkas dari job & per dokumen
                 err_msg = None
                 try:
-                    errors = data.get("errors") or []
-                    if errors:
-                        parts = []
-                        for e in errors[:2]:
-                            parts.append(f"{e.get('code')}: {e.get('message')}")
+                    errs = data.get("errors") or []
+                    if errs:
+                        parts = [f"{e.get('code')}: {e.get('message')}" for e in errs[:3]]
                         err_msg = " | ".join(parts)
-                    # detail dokumen
+
                     docs_url = (status_url.rstrip("/")) + "/documents?skip=0&top=20"
                     d = await httpx.AsyncClient(timeout=15).get(docs_url, headers=headers)
                     if d.status_code == 200:
                         dj = d.json()
                         failed = [
-                            f"[{it.get('id')}] {it.get('path')} → {it.get('status')} "
-                            f"{(it.get('error') or {}).get('code')}: {(it.get('error') or {}).get('message')}"
+                            f"{(it.get('error') or {}).get('code')}: {(it.get('error') or {}).get('message')} (path={it.get('path')})"
                             for it in (dj.get('value') or []) if it.get('status') not in ('Succeeded', 'Running')
                         ]
-                        if failed and not err_msg:
-                            err_msg = " ; ".join(failed[:2])
+                        if failed:
+                            if err_msg:
+                                err_msg += " || " + " ; ".join(failed[:2])
+                            else:
+                                err_msg = " ; ".join(failed[:2])
                 except Exception:
                     pass
 
