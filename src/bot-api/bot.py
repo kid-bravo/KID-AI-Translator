@@ -1,10 +1,14 @@
 from botbuilder.core import ActivityHandler, TurnContext
 import os, httpx, uuid, logging, asyncio, datetime
 
-# ====== Translator (GLOBAL endpoint) ======
+# ====== Translator (Text → GLOBAL endpoint) ======
 TRANSLATOR_ENDPOINT = (os.getenv("TRANSLATOR_ENDPOINT") or "").rstrip("/")
 TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
+
+# ====== Translator (Document Translation → RESOURCE endpoint) ======
+# Harus berbentuk: https://<nama-resource>.cognitiveservices.azure.com
+DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
 
 # ====== Storage (Document Translation) ======
 from azure.storage.blob import (
@@ -112,8 +116,17 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
-    # ===== Document Translation handler (dengan protected download fallback) =====
+    # ===== Document Translation handler (fixed endpoint + SAS folder + downloadUrl) =====
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
+        # 0) Validasi endpoint batch (bukan global)
+        if not DOC_TRANSLATION_ENDPOINT or "cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT:
+            await turn_context.send_activity(
+                "Konfigurasi belum lengkap: `DOC_TRANSLATION_ENDPOINT` harus diisi "
+                "dengan endpoint resource Translator, contoh:\n"
+                "`https://<nama-resource>.cognitiveservices.azure.com`"
+            )
+            return
+
         att = turn_context.activity.attachments[0]
         name = att.name or f"file-{uuid.uuid4()}"
         content_url = getattr(att, "content_url", "") or ""
@@ -137,7 +150,7 @@ class TranslatorBot(ActivityHandler):
             await turn_context.send_activity("Lampiran tidak memiliki URL unduh yang valid.")
             return
 
-        # 2) Download file → coba tanpa auth dulu, bila gagal, retry dengan Bearer token bot
+        # 2) Download file → coba tanpa auth, bila gagal retry Bearer token bot
         file_bytes = None
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -160,7 +173,7 @@ class TranslatorBot(ActivityHandler):
             )
             return
 
-        # 3) Upload ke Blob input/
+        # 3) Upload ke Blob input/<jobId>/<namaFile>
         if not (STORAGE_ACCOUNT_NAME and STORAGE_ACCOUNT_KEY):
             await turn_context.send_activity("Storage belum dikonfigurasi di server.")
             return
@@ -170,45 +183,41 @@ class TranslatorBot(ActivityHandler):
             credential=STORAGE_ACCOUNT_KEY
         )
 
-        blob_name = f"{uuid.uuid4()}-{name}"
-        bs.get_blob_client(container=STORAGE_CONTAINER_SOURCE, blob=blob_name).upload_blob(
+        job_id = str(uuid.uuid4())
+        src_blob_name = f"{job_id}/{name}"  # simpan di folder jobId
+        bs.get_blob_client(container=STORAGE_CONTAINER_SOURCE, blob=src_blob_name).upload_blob(
             file_bytes, overwrite=True
         )
 
-        # 4) SAS read untuk input blob
-        sas_read = generate_blob_sas(
+        # 4) Buat SAS FOLDER (PERHATIKAN URUTAN: path dahulu, baru ?sas)
+        #    Source:  https://.../input/<jobId>?<sas with read+list>
+        #    Target:  https://.../output/<jobId>?<sas with write+add+create+list>
+        sas_read_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
-            blob_name=blob_name,
             account_key=STORAGE_ACCOUNT_KEY,
-            permission=BlobSasPermissions(read=True),
+            permission=ContainerSasPermissions(read=True, list=True),
             expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
         )
-        source_sas_url = (
+        source_url = (
             f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
-            f"{STORAGE_CONTAINER_SOURCE}/{blob_name}?{sas_read}"
+            f"{STORAGE_CONTAINER_SOURCE}/{job_id}?{sas_read_container}"
         )
 
-        # 5) SAS write untuk output container (folder = job_id)
-        job_id = str(uuid.uuid4())
-        sas_write = generate_container_sas(
+        sas_write_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
             account_key=STORAGE_ACCOUNT_KEY,
             permission=ContainerSasPermissions(write=True, add=True, create=True, list=True),
             expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
         )
-        target_sas_url = (
+        target_url = (
             f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
-            f"{STORAGE_CONTAINER_TARGET}?{sas_write}"
+            f"{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_write_container}"
         )
 
-        # 6) Submit Document Translation (Batch API)
-        if not (TRANSLATOR_ENDPOINT and TRANSLATOR_KEY):
-            await turn_context.send_activity("Translator belum dikonfigurasi di server.")
-            return
-
-        batch_url = f"{TRANSLATOR_ENDPOINT}/translator/text/batch/v1.1/batches"
+        # 5) Submit Document Translation (Batch API) → gunakan ENDPOINT RESOURCE
+        batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.1/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
             "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
@@ -216,24 +225,23 @@ class TranslatorBot(ActivityHandler):
         }
         payload = {
             "inputs": [{
-                "source": {"sourceUrl": source_sas_url},
-                "targets": [{
-                    "targetUrl": f"{target_sas_url}/{job_id}",
-                    "language": to_lang
-                }]
+                "source": {"sourceUrl": source_url},
+                "targets": [{ "targetUrl": target_url, "language": to_lang }]
             }]
         }
 
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(batch_url, headers=headers, json=payload)
             if r.status_code not in (201, 202):
-                await turn_context.send_activity(f"Submit job gagal: {r.status_code} {r.text[:300]}")
+                await turn_context.send_activity(
+                    f"Submit job gagal {r.status_code}: {r.text[:400]}"
+                )
                 return
             status_url = r.headers.get("Operation-Location") or r.headers.get("Location")
 
         await turn_context.send_activity(f"Job diterima untuk **{name}**. Menunggu hasil…")
 
-        # 7) Poll status hingga selesai (~90 detik)
+        # 6) Poll status hingga selesai (~90 detik)
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 for _ in range(30):
@@ -247,7 +255,7 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(f"Job gagal/berhenti. Status: **{data.get('status')}**")
                 return
 
-            # 8) Enumerasi hasil di output/<job_id>/
+            # 7) Enumerasi hasil di output/<jobId>/
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
 
