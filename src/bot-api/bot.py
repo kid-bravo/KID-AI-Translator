@@ -101,7 +101,7 @@ class TranslatorBot(ActivityHandler):
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -202,9 +202,10 @@ class TranslatorBot(ActivityHandler):
             file_bytes, overwrite=True
         )
 
-        # 4) SAS CONTAINER + filter.prefix (paling aman) — Expire 4 jam.
+        # 4) SAS CONTAINER (source) + filter.prefix & FOLDER (target) — Expire 4 jam.
         expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=4)
 
+        # SOURCE = CONTAINER SAS (read + list)
         sas_src_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_SOURCE,
@@ -212,6 +213,9 @@ class TranslatorBot(ActivityHandler):
             permission=ContainerSasPermissions(read=True, list=True),
             expiry=expiry
         )
+        source_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}?{sas_src_container}"
+
+        # TARGET = FOLDER path sebelum ? + CONTAINER SAS izin w+a+c+l(+r)
         sas_tgt_container = generate_container_sas(
             account_name=STORAGE_ACCOUNT_NAME,
             container_name=STORAGE_CONTAINER_TARGET,
@@ -219,17 +223,15 @@ class TranslatorBot(ActivityHandler):
             permission=ContainerSasPermissions(write=True, add=True, create=True, list=True, read=True),
             expiry=expiry
         )
-
-        source_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_SOURCE}?{sas_src_container}"
-        target_container_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}?{sas_tgt_container}"
+        target_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{job_id}?{sas_tgt_container}"
 
         # ---- DEBUG LOG SAS (TER-MASKING) ----
         logging.warning(f"[DEBUG-SAS] SOURCE_CONTAINER_URL = {_mask_sas(source_container_url)}")
-        logging.warning(f"[DEBUG-SAS] TARGET_CONTAINER_URL = {_mask_sas(target_container_url)}")
-        logging.warning(f"[DEBUG-SAS] FILTER_PREFIX = {job_id}/")
+        logging.warning(f"[DEBUG-SAS] TARGET_URL          = {_mask_sas(target_url)}")
+        logging.warning(f"[DEBUG-SAS] FILTER_PREFIX       = {job_id}/")
         # -------------------------------------
 
-        # 5) Submit batch (sourceUrl=CONTAINER + filter.prefix)
+        # 5) Submit batch (source=container + filter.prefix, target=folder path)
         batch_url = f"{DOC_TRANSLATION_ENDPOINT}/translator/text/batch/v1.0/batches"
         headers = {
             "Ocp-Apim-Subscription-Key": DOC_TRANSLATION_KEY,
@@ -242,7 +244,7 @@ class TranslatorBot(ActivityHandler):
                     "filter": { "prefix": f"{job_id}/" }
                 },
                 "targets": [{
-                    "targetUrl": f"{target_container_url}/{job_id}",
+                    "targetUrl": target_url,
                     "language": to_lang
                 }]
             }]
@@ -290,9 +292,7 @@ class TranslatorBot(ActivityHandler):
                 except Exception as ex:
                     logging.exception(f"pull-detail-failed: {ex}")
 
-                # ---- kirim juga RAW job (dipotong) agar pasti ada konteks
                 raw_snippet = json.dumps(data)[:1200]
-
                 msg = f"Job gagal/berhenti. Status: **{data.get('status')}**"
                 if err_msg:
                     msg += f" — Detail: {err_msg}"
