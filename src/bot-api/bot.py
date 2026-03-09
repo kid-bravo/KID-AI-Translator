@@ -48,7 +48,6 @@ def _mask_sas(url: str) -> str:
 
 
 class TranslatorBot(ActivityHandler):
-
     # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         welcome = (
@@ -122,10 +121,6 @@ class TranslatorBot(ActivityHandler):
 
     # ---------- Helper: parse 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
-        """
-        Return (from_lang, to_lang, content).
-        Jika tidak ada 'xx->yy', from_lang=None (auto), to_lang='en'.
-        """
         default_to = "en"
         if not text:
             return None, default_to, ""
@@ -287,8 +282,8 @@ class TranslatorBot(ActivityHandler):
                         ]
                         if failed:
                             err_msg = (err_msg + " || " if err_msg else "") + " ; ".join(failed[:2])
-                except Exception:
-                    pass
+                except Exception as ex:
+                    logging.exception(f"pull-detail-failed: {ex}")
 
                 msg = f"Job gagal/berhenti. Status: **{data.get('status')}**"
                 if err_msg:
