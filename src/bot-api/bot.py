@@ -9,7 +9,7 @@ TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
 # ===== Translator (Document Translation - RESOURCE endpoint) ==========
-# Contoh BENAR: https://<nama-resource>.cognitiveservices.azure.com
+# Contoh: https://<nama-resource>.cognitiveservices.azure.com
 DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
 DOC_TRANSLATION_KEY      = os.getenv("DOC_TRANSLATION_KEY") or os.getenv("TRANSLATOR_KEY")
 
@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
 
 # ===================== Preferensi bahasa (in-memory) ==================
-SESSIONS = {}  # SESSIONS[user_id] = {"from_lang": None|"id"|..., "to_lang": "en"|...}
+SESSIONS = {}  # { user_id: { "from_lang": None|"id"|..., "to_lang": "en"|... } }
 
 # ===================== Daftar bahasa di Card ==========================
 LANG_CHOICES = [
@@ -78,10 +78,10 @@ class TranslatorBot(ActivityHandler):
     # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
         user_id = (turn_context.activity.from_property and turn_context.activity.from_property.id) or "unknown"
-        text = (turn_context.activity.text or "").strip()
-        value = turn_context.activity.value or {}
+        text   = (turn_context.activity.text or "").strip()
+        value  = turn_context.activity.value or {}
 
-        # A) Submit dari Menu Card / Language Card
+        # A) Submit dari Menu/Language Card
         if isinstance(value, dict):
             vtype  = value.get("type")
             action = value.get("action")
@@ -246,8 +246,9 @@ class TranslatorBot(ActivityHandler):
     # ---------- Util: Teams File Download Card ----------
     def _teams_file_download_card(self, file_name: str, download_url: str, unique_id: str):
         ext = file_name.split(".")[-1].lower() if "." in file_name else "bin"
+        # ⚠ PERBAIKAN MIME TYPE: gunakan ".card.file.download.info"
         return Attachment(
-            content_type="application/vnd.microsoft.teams.file.download.info",
+            content_type="application/vnd.microsoft.teams.card.file.download.info",
             content={
                 "downloadUrl": download_url,
                 "uniqueId": unique_id,
