@@ -9,7 +9,6 @@ TRANSLATOR_REGION   = os.getenv("TRANSLATOR_REGION", "southeastasia")
 TRANSLATOR_KEY      = os.getenv("TRANSLATOR_KEY")
 
 # ===== Translator (Document Translation - RESOURCE endpoint) ==========
-# Contoh: https://<nama-resource>.cognitiveservices.azure.com
 DOC_TRANSLATION_ENDPOINT = (os.getenv("DOC_TRANSLATION_ENDPOINT") or "").rstrip("/")
 DOC_TRANSLATION_KEY      = os.getenv("DOC_TRANSLATION_KEY") or os.getenv("TRANSLATOR_KEY")
 
@@ -243,10 +242,10 @@ class TranslatorBot(ActivityHandler):
             return a.lower(), b.lower(), " ".join(parts[1:])
         return None, default_to, text
 
-    # ---------- Util: Teams File Download Card ----------
-    def _teams_file_download_card(self, file_name: str, download_url: str, unique_id: str):
+    # ---------- Util: Teams File Download Card (MIME DIBETULKAN) ----------
+    def _teams_file_download_card(self, file_name: str, download_url: str, unique_id: str) -> Attachment:
         ext = file_name.split(".")[-1].lower() if "." in file_name else "bin"
-        # ⚠ PERBAIKAN MIME TYPE: gunakan ".card.file.download.info"
+        # MIME harus EXACT seperti di bawah:
         return Attachment(
             content_type="application/vnd.microsoft.teams.card.file.download.info",
             content={
@@ -417,7 +416,7 @@ class TranslatorBot(ActivityHandler):
                 await turn_context.send_activity(msg)
                 return
 
-            # 7) Kirim hasil sebagai **Teams File Download Card** (file bubble)
+            # 7) Kirim hasil: coba File Download Card → fallback ke link kalau ditolak
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
             if not blobs:
@@ -437,9 +436,15 @@ class TranslatorBot(ActivityHandler):
                 )
                 download_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
                 file_name = b.name.split("/", 1)[-1]  # buang prefix job_id/
-                file_card = self._teams_file_download_card(file_name, download_url, unique_id=b.name)
 
-                await turn_context.send_activity(Activity(type="message", attachments=[file_card]))
+                # --- kirim sebagai FILE BUBBLE ---
+                try:
+                    file_card = self._teams_file_download_card(file_name, download_url, unique_id=b.name)
+                    await turn_context.send_activity(Activity(type="message", attachments=[file_card]))
+                except Exception as send_err:
+                    logging.exception(f"send-file-card failed: {send_err}")
+                    # --- fallback: kirim link biasa agar user tetap dapat hasil ---
+                    await turn_context.send_activity(download_url)
 
         except Exception as e:
             logging.exception("document-translation polling failed")
