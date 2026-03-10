@@ -1,21 +1,21 @@
+# --- Runtime web (sesuaikan dengan project kamu) ---
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 gunicorn==21.2.0
-httpx==0.27.0
 
-# Bot Framework (versi selaras)
-botbuilder-core==4.14.6
-# botbuilder-schema akan ter-install otomatis oleh botbuilder-core 4.14.6
-
+# --- HTTP client ---
+httpx==0.24.1
 aiohttp==3.9.3
 
+# --- Bot Framework (VERSI SELARAS) ---
+botbuilder-core==4.14.6
+botbuilder-schema==4.14.6         # eksplisitkan biar selaras
+botframework-connector==4.14.6    # <— WAJIB untuk MicrosoftAppCredentials
+
+# --- Azure Blob Storage (WAJIB untuk alur dokumen) ---
 azure-storage-blob==12.20.0
+azure-core==1.29.0                # cocok dengan blob 12.20.0
+msrest==0.7.1                     # aman untuk dependency connector
 
-
-# Azure Blob Storage (WAJIB untuk alur dokumen)
-azure-storage-blob==12.20.0
-azure-core>=1.29.0
-
-
-# (opsional tapi aman dipasang)
+# --- Tambahan aman ---
 typing_extensions>=4.7.0
