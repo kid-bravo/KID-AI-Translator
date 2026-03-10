@@ -1,6 +1,8 @@
 from botbuilder.core import TurnContext
 from botbuilder.core.teams import TeamsActivityHandler
 from botbuilder.schema import Attachment, Activity
+from botbuilder.schema.teams import FileConsentCardResponse
+
 import os, httpx, uuid, logging, asyncio, datetime, json
 from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 
@@ -35,10 +37,11 @@ logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
 
 # ===================== Preferensi bahasa (in-memory) ==================
-SESSIONS = {}  # { user_id: { "from_lang": None|"id"|..., "to_lang": "en"|... } }
+# SESSIONS[user_id] = {"from_lang": None|"id"|..., "to_lang": "en"|...}
+SESSIONS = {}
 
 # ===================== Pending consent map ============================
-# Map uniqueId -> { "file_name":..., "blob_name":..., "download_url":..., "size": int }
+# PENDING_CONSENTS[unique_id] = { "file_name":..., "download_url":..., "size": int }
 PENDING_CONSENTS = {}
 
 # ===================== Daftar bahasa di Card ==========================
@@ -60,6 +63,8 @@ LANG_CHOICES = [
     ("Portuguese (pt)", "pt"),
 ]
 
+
+# ===================== Util: mask 'sig' SAS di log ====================
 def _mask_sas(url: str) -> str:
     try:
         parts = urlsplit(url)
@@ -73,6 +78,7 @@ def _mask_sas(url: str) -> str:
 
 
 class TranslatorBot(TeamsActivityHandler):
+
     # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         await self._send_menu_card(turn_context)
@@ -150,7 +156,7 @@ class TranslatorBot(TeamsActivityHandler):
 
         headers = {
             "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
             "Content-type": "application/json",
             "X-ClientTraceId": str(uuid.uuid4())
         }
@@ -240,32 +246,31 @@ class TranslatorBot(TeamsActivityHandler):
             return a.lower(), b.lower(), rest
         return None, None, text
 
-    # ---------- Util: File Consent Card ----------
+    # ---------- Util: File Consent Card (WAJIB name di ROOT) ----------
     def _file_consent_card(self, file_name: str, file_size_bytes: int, description: str, unique_id: str) -> Attachment:
-        # https://learn.microsoft.com/microsoftteams/platform/task-modules-and-cards/cards/cards-reference#file-consent-card
         return Attachment(
             content_type="application/vnd.microsoft.teams.card.file.consent",
+            name=file_name,  # <— penting untuk render kartu
             content={
                 "description": description,
-                "sizeInBytes": file_size_bytes,
+                "sizeInBytes": int(file_size_bytes),
                 "acceptContext": { "uniqueId": unique_id },
-                "declineContext": { "uniqueId": unique_id },
-                "name": file_name
+                "declineContext": { "uniqueId": unique_id }
             }
         )
 
+    # ---------- Util: File Info Card (OneDrive) ----------
     def _file_info_card(self, file_name: str, unique_id: str) -> Attachment:
-        # Card yang menunjukkan file sudah di OneDrive user (dari Teams)
         return Attachment(
             content_type="application/vnd.microsoft.teams.card.file.info",
+            name=file_name,  # <— tampil sebagai judul kartu
             content={
                 "uniqueId": unique_id,
                 "fileType": (file_name.split(".")[-1].lower() if "." in file_name else "bin")
-            },
-            name=file_name
+            }
         )
 
-    # ---------- Dokumen ----------
+    # ---------- Dokumen: proses upload + batch translate + kirim consent ----------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
         # Validasi endpoint/keys
         if (not DOC_TRANSLATION_ENDPOINT) or ("cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT):
@@ -298,7 +303,7 @@ class TranslatorBot(TeamsActivityHandler):
             await turn_context.send_activity("Lampiran tidak memiliki URL unduh yang valid.")
             return
 
-        # 2) Unduh bytes lampiran
+        # 2) Unduh bytes lampiran (tanpa auth → fallback Bearer token bot)
         try:
             file_bytes = None
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -316,7 +321,7 @@ class TranslatorBot(TeamsActivityHandler):
         except Exception:
             logging.exception("download attachment failed")
             await turn_context.send_activity(
-                "Gagal mengunduh file dari Teams. Coba **drag-&-drop dari perangkat**. "
+                "Gagal mengunduh file dari Teams. Coba **drag-&-drop dari perangkat**."
             )
             return
 
@@ -376,7 +381,7 @@ class TranslatorBot(TeamsActivityHandler):
         # 6) Poll status
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                for _ in range(40):
+                for _ in range(40):  # sampai ~2 menit
                     s = await client.get(status_url, headers=headers)
                     data = s.json()
                     if data.get("status") in ("Succeeded", "Failed", "Cancelled", "ValidationFailed"):
@@ -412,16 +417,16 @@ class TranslatorBot(TeamsActivityHandler):
                 await turn_context.send_activity(msg)
                 return
 
-            # 7) Siapkan kirim File Consent (OneDrive)
+            # 7) Siapkan File Consent (OneDrive)
             cc = bs.get_container_client(STORAGE_CONTAINER_TARGET)
             blobs = list(cc.list_blobs(name_starts_with=f"{job_id}/"))
             if not blobs:
                 await turn_context.send_activity("Job selesai tapi file hasil tidak ditemukan.")
                 return
 
-            # Ambil 1 file (atau loop kalau mau multi)
+            # Ambil 1 file hasil
             b = blobs[0]
-            # Download hasil ke memory untuk mengetahui ukuran dan untuk upload nanti
+            # Buat SAS read untuk dapatkan ukuran + upload nanti
             sas_read_out = generate_blob_sas(
                 account_name=STORAGE_ACCOUNT_NAME,
                 container_name=STORAGE_CONTAINER_TARGET,
@@ -433,19 +438,20 @@ class TranslatorBot(TeamsActivityHandler):
             download_url = f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{STORAGE_CONTAINER_TARGET}/{b.name}?{sas_read_out}"
             file_name = b.name.split("/", 1)[-1]
 
-            # Ambil ukuran
+            # Hitung size
             async with httpx.AsyncClient(timeout=30) as client:
+                # HEAD kadang tidak diaktifkan; fallback GET jika perlu
                 head = await client.head(download_url)
-                size = int(head.headers.get("Content-Length", "0"))
-                if size == 0:
-                    # fallback GET kalau HEAD tidak tersedia
+                if head.status_code == 200 and head.headers.get("Content-Length"):
+                    size = int(head.headers.get("Content-Length"))
+                else:
                     getr = await client.get(download_url)
+                    getr.raise_for_status()
                     size = len(getr.content)
 
-            unique_id = b.name  # pakai path blob sebagai unique id
+            unique_id = b.name  # gunakan path blob sebagai unique id
             PENDING_CONSENTS[unique_id] = {
                 "file_name": file_name,
-                "blob_name": b.name,
                 "download_url": download_url,
                 "size": size
             }
@@ -462,74 +468,64 @@ class TranslatorBot(TeamsActivityHandler):
             logging.exception("document-translation polling failed")
             await turn_context.send_activity(f"Gagal memproses dokumen: {e}")
 
-    # ---------- INVOKE handler untuk File Consent ----------
-    async def on_teams_invoke_activity(self, turn_context: TurnContext):
-        name = (turn_context.activity.name or "").lower()
-        if name == "fileconsent/invoke":
-            # Struktur value:
-            # { "action": "accept"|"decline", "context": { ... }, "uploadInfo": { "name","uploadUrl","uniqueId","fileType" } }
-            val = turn_context.activity.value or {}
-            action = (val.get("action") or "").lower()
-            if action == "accept":
-                upload_info = val.get("uploadInfo") or {}
-                unique_id   = upload_info.get("uniqueId")
-                upload_url  = upload_info.get("uploadUrl")
-                # Ambil pending
-                pending = PENDING_CONSENTS.get(unique_id)
-                if not pending:
-                    await turn_context.send_activity("Konteks file tidak ditemukan. Coba ulangi proses.")
-                    return
+    # ---------- TEAMS: File Consent (Accept) ----------
+    async def on_teams_file_consent_accept(self, turn_context: TurnContext, file_consent_card_response: FileConsentCardResponse):
+        try:
+            upload_info = file_consent_card_response.upload_info or {}
+            # SDK v4.14 expose attributes; siapkan fallback dict.get
+            unique_id  = getattr(upload_info, "unique_id", None) or upload_info.get("uniqueId")
+            upload_url = getattr(upload_info, "upload_url", None) or upload_info.get("uploadUrl")
+            file_name  = getattr(upload_info, "name", None)      or upload_info.get("name")
 
-                file_name   = pending["file_name"]
-                download_url= pending["download_url"]
-                size        = pending["size"]
+            pending = PENDING_CONSENTS.get(unique_id)
+            if not pending:
+                await turn_context.send_activity("Konteks file tidak ditemukan. Coba ulang.")
+                return
 
-                # Download konten hasil dari Blob, lalu PUT ke uploadUrl (OneDrive user)
-                try:
-                    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-                        # Dapatkan bytes (stream)
-                        src = await client.get(download_url)
-                        src.raise_for_status()
-                        data = src.content
-                        # Upload ke OneDrive (Teams uploadUrl) — butuh header Content-Length & Content-Range
-                        headers = {
-                            "Content-Length": str(len(data)),
-                            "Content-Range": f"bytes 0-{len(data)-1}/{len(data)}"
-                        }
-                        putr = await client.put(upload_url, content=data, headers=headers)
-                        putr.raise_for_status()
-                except Exception as e:
-                    logging.exception("onedrive upload failed")
-                    await turn_context.send_activity(f"Gagal mengunggah ke OneDrive: {e}")
-                    # fallback kirim link SAS
-                    await turn_context.send_activity(download_url)
-                    return
+            # Ambil bytes dari Blob
+            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+                src = await client.get(pending["download_url"])
+                src.raise_for_status()
+                data = src.content
 
-                # Kirim File Info Card (notifikasi file siap di OneDrive user) + bersihkan pending
-                file_info = self._file_info_card(file_name=file_name, unique_id=unique_id)
-                await turn_context.send_activity(Activity(type="message", attachments=[file_info]))
-                await turn_context.send_activity("✅ Hasil sudah tersimpan di OneDrive Anda (klik kartu di atas).")
-                try:
+                # Upload ke OneDrive via uploadUrl (PUT, butuh Content-Length & Content-Range)
+                headers = {
+                    "Content-Length": str(len(data)),
+                    "Content-Range": f"bytes 0-{len(data)-1}/{len(data)}"
+                }
+                putr = await client.put(upload_url, content=data, headers=headers)
+                putr.raise_for_status()
+
+            # Kirim File Info Card (OneDrive)
+            file_info = self._file_info_card(file_name=file_name, unique_id=unique_id)
+            await turn_context.send_activity(Activity(type="message", attachments=[file_info]))
+            await turn_context.send_activity("✅ Hasil tersimpan di OneDrive (klik kartu di atas).")
+
+        except Exception as e:
+            logging.exception("onedrive upload failed")
+            await turn_context.send_activity(f"Gagal mengunggah ke OneDrive: {e}")
+            # fallback kirim link SAS
+            pending = PENDING_CONSENTS.get(unique_id) if 'unique_id' in locals() else None
+            if pending:
+                await turn_context.send_activity(pending["download_url"])
+        finally:
+            try:
+                if 'unique_id' in locals() and unique_id in PENDING_CONSENTS:
                     del PENDING_CONSENTS[unique_id]
-                except Exception:
-                    pass
-                return
+            except Exception:
+                pass
 
-            else:
-                # Decline → fallback kirim link SAS agar user tetap dapat hasil
-                ctx = (val.get("context") or {})
-                unique_id = (ctx.get("uniqueId") if isinstance(ctx, dict) else None)
-                pending = PENDING_CONSENTS.get(unique_id) if unique_id else None
-                if pending:
-                    await turn_context.send_activity("Anda menolak menyimpan ke OneDrive. Berikut link unduh hasilnya:")
-                    await turn_context.send_activity(pending["download_url"])
-                    try:
-                        del PENDING_CONSENTS[unique_id]
-                    except Exception:
-                        pass
-                else:
-                    await turn_context.send_activity("Operasi dibatalkan.")
-                return
-
-        # invoke lain biarkan ke default
-        return await super().on_teams_invoke_activity(turn_context)
+    # ---------- TEAMS: File Consent (Decline) ----------
+    async def on_teams_file_consent_decline(self, turn_context: TurnContext, file_consent_card_response: FileConsentCardResponse):
+        ctx = file_consent_card_response.context or {}
+        unique_id = getattr(ctx, "unique_id", None) or (ctx.get("uniqueId") if isinstance(ctx, dict) else None)
+        pending = PENDING_CONSENTS.get(unique_id) if unique_id else None
+        if pending:
+            await turn_context.send_activity("Anda menolak menyimpan ke OneDrive. Berikut link unduh hasilnya:")
+            await turn_context.send_activity(pending["download_url"])
+            try:
+                del PENDING_CONSENTS[unique_id]
+            except Exception:
+                pass
+        else:
+            await turn_context.send_activity("Operasi dibatalkan.")
