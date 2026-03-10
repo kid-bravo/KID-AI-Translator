@@ -6,12 +6,13 @@ gunicorn==21.2.0
 # --- HTTP client (dipakai bot.py) ---
 httpx==0.24.1
 
-# --- Microsoft Bot Framework (VERSI SELARAS) ---
+
+# === Wajib untuk bot kita ===
 botbuilder-core==4.14.6
-botframework-connector==4.14.6     # Penting untuk MicrosoftAppCredentials (Bearer token)
+botframework-connector==4.14.6
+httpx==0.24.1
+azure-storage-blob==12.20.0
 
-# --- Azure Blob Storage (dipakai untuk upload/hasil dokumen) ---
-azure-storage-blob==12.20.0         # Akan otomatis menarik azure-core versi yang cocok
-
-# --- (Opsional, aman) ---
+# (opsional, aman)
 typing_extensions>=4.7.0
+
