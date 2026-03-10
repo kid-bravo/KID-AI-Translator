@@ -20,3 +20,4 @@ azure-core>=1.29.0
 # (opsional tapi aman dipasang)
 typing_extensions>=4.7.0
 
+botframework-connector==4.14.6.
