@@ -1,18 +1,21 @@
-# --- Web runtime (pakai yang memang kamu gunakan di project) ---
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 gunicorn==21.2.0
+httpx==0.27.0
 
-# --- HTTP client (dipakai bot.py) ---
-httpx==0.24.1
-
-
-# === Wajib untuk bot kita ===
+# Bot Framework (versi selaras)
 botbuilder-core==4.14.6
-botframework-connector==4.14.6
-httpx==0.24.1
+# botbuilder-schema akan ter-install otomatis oleh botbuilder-core 4.14.6
+
+aiohttp==3.9.3
+
 azure-storage-blob==12.20.0
 
-# (opsional, aman)
+# Azure Blob Storage (WAJIB untuk alur dokumen)
+azure-storage-blob==12.20.0
+azure-core>=1.29.0
+
+# (opsional tapi aman dipasang)
 typing_extensions>=4.7.0
 
+botframework-connector==4.14.6.
