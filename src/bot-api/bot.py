@@ -72,13 +72,27 @@ def _mask_sas(url: str) -> str:
 
 class TranslatorBot(ActivityHandler):
 
+    # ---------- Helper: standardisasi user_id ----------
+    def _get_user_id(self, turn_context: TurnContext) -> str:
+        a = turn_context.activity
+        try:
+            user_id = (
+                getattr(getattr(a, "from_property", None), "aad_object_id", None)
+                or getattr(getattr(a, "from_property", None), "id", None)
+                or getattr(getattr(a, "conversation", None), "id", None)
+                or "unknown"
+            )
+            return str(user_id)
+        except Exception:
+            return "unknown"
+
     # ---------------------- Greetings ----------------------
     async def on_members_added_activity(self, members_added, turn_context: TurnContext):
         await self._send_menu_card(turn_context)
 
     # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
-        user_id = (turn_context.activity.from_property and turn_context.activity.from_property.id) or "unknown"
+        user_id = self._get_user_id(turn_context)
         text = (turn_context.activity.text or "").strip()
         value = turn_context.activity.value or {}
 
@@ -123,11 +137,12 @@ class TranslatorBot(ActivityHandler):
 
         # D) Teks
         explicit_from, explicit_to, content = self._parse_direction(text)
-        # Jika user tidak tulis 'xx->yy', gunakan preferensi card (bukan default en)
-        if "->" in (text.split(" ", 1)[0] if text else ""):
+        pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
+
+        if explicit_to:  # user menulis 'xx->yy'
             from_lang, to_lang = explicit_from, explicit_to
         else:
-            pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
+            # TIDAK ada 'xx->yy' → WAJIB pakai preferensi dari card
             from_lang = pref.get("from_lang")  # None => auto detect
             to_lang   = pref.get("to_lang") or "en"
 
@@ -162,6 +177,7 @@ class TranslatorBot(ActivityHandler):
                     return
                 data = r.json()
             translated = data[0]["translations"][0]["text"]
+            logging.info(f"[text-translate] user={user_id} from={from_lang or 'auto'} to={to_lang} len={len(content)}")
             await turn_context.send_activity(translated)
         except Exception as e:
             logging.exception("translate-text failed")
@@ -183,11 +199,8 @@ class TranslatorBot(ActivityHandler):
                 {"type": "Action.Submit", "title": "ℹ️ How to upload", "data": {"type": "menu", "action": "how_to_upload"}}
             ]
         }
-        attachment = Attachment(
-            content_type="application/vnd.microsoft.card.adaptive",
-            content=card
-        )
-        activity = Activity(type="message", attachments=[attachment])
+        attachment = Attachment(content_type="application/vnd.microsoft.card.adaptive", content=card)
+        activity   = Activity(type="message", attachments=[attachment])
         await turn_context.send_activity(activity)
 
     # ---------- HOW TO UPLOAD ----------
@@ -226,26 +239,24 @@ class TranslatorBot(ActivityHandler):
                 {"type": "Action.Submit", "title": "Start", "data": {"type": "set_lang"}}
             ]
         }
-        attachment = Attachment(
-            content_type="application/vnd.microsoft.card.adaptive",
-            content=card
-        )
-        activity = Activity(type="message", attachments=[attachment])
+        attachment = Attachment(content_type="application/vnd.microsoft.card.adaptive", content=card)
+        activity   = Activity(type="message", attachments=[attachment])
         await turn_context.send_activity(activity)
 
     # ---------- Parser arah 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
         """
-        Return (from_lang, to_lang, content) hanya jika user menulis 'xx->yy ...'.
-        Jika tidak ada arah, kembalikan (None, None, text) agar preferensi card terpakai.
+        Mengembalikan (from_lang, to_lang, content) HANYA jika user menulis 'xx->yy ...'.
+        Jika tidak, kembalikan (None, None, text) agar preferensi card dipakai.
         """
         if not text:
             return None, None, ""
         parts = text.split(" ", 1)
         first = parts[0]
-        if "->" in first and len(parts) > 1:
+        if "->" in first:
             a, b = first.split("->", 1)
-            return a.lower(), b.lower(), parts[1]
+            rest = parts[1] if len(parts) > 1 else ""
+            return (a or "").lower(), (b or "").lower(), rest
         return None, None, text
 
     # ---------- Util: Teams File Download Card ----------
@@ -264,6 +275,7 @@ class TranslatorBot(ActivityHandler):
 
     # ---------- Dokumen ----------
     async def _handle_attachments(self, turn_context: TurnContext, to_lang: str = "en"):
+        logging.info(f"[doc-translate] to={to_lang}")
         # Validasi endpoint/keys
         if (not DOC_TRANSLATION_ENDPOINT) or ("cognitive.microsofttranslator.com" in DOC_TRANSLATION_ENDPOINT):
             await turn_context.send_activity(
