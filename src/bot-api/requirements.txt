@@ -1,21 +1,17 @@
-# --- Runtime web (sesuaikan dengan project kamu) ---
+# --- Web runtime (pakai yang memang kamu gunakan di project) ---
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 gunicorn==21.2.0
 
-# --- HTTP client ---
+# --- HTTP client (dipakai bot.py) ---
 httpx==0.24.1
-aiohttp==3.9.3
 
-# --- Bot Framework (VERSI SELARAS) ---
+# --- Microsoft Bot Framework (VERSI SELARAS) ---
 botbuilder-core==4.14.6
-botbuilder-schema==4.14.6         # eksplisitkan biar selaras
-botframework-connector==4.14.6    # <— WAJIB untuk MicrosoftAppCredentials
+botframework-connector==4.14.6     # Penting untuk MicrosoftAppCredentials (Bearer token)
 
-# --- Azure Blob Storage (WAJIB untuk alur dokumen) ---
-azure-storage-blob==12.20.0
-azure-core==1.29.0                # cocok dengan blob 12.20.0
-msrest==0.7.1                     # aman untuk dependency connector
+# --- Azure Blob Storage (dipakai untuk upload/hasil dokumen) ---
+azure-storage-blob==12.20.0         # Akan otomatis menarik azure-core versi yang cocok
 
-# --- Tambahan aman ---
+# --- (Opsional, aman) ---
 typing_extensions>=4.7.0
