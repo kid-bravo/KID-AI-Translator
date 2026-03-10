@@ -1,17 +1,8 @@
+
 from botbuilder.core import TurnContext, ConversationReference
 from botbuilder.core.teams import TeamsActivityHandler
-from botbuilder.schema import Attachment, Activity
-# InvokeResponse ada di schema 4.14.x; kalau lingkungan berbeda, guard di bawah akan jaga
-try:
-    from botbuilder.schema import InvokeResponse
-except Exception:
-    InvokeResponse = None  # guard
-
-# ----- OPTIONAL TYPES (guard supaya app tidak crash jika versi SDK berbeda) -----
-try:
-    from botbuilder.schema.teams import FileConsentCardResponse
-except Exception:
-    FileConsentCardResponse = object  # hanya untuk type hint/kompatibilitas
+from botbuilder.schema import Attachment, Activity, InvokeResponse
+from botbuilder.schema.teams import FileConsentCardResponse
 
 import os, httpx, uuid, logging, asyncio, datetime, json
 from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
@@ -47,7 +38,8 @@ logging.basicConfig(level=logging.INFO)
 MAX_TEXT_LEN = 5000
 
 # ===================== Preferensi bahasa (in-memory) ==================
-SESSIONS = {}  # { user_id: { "from_lang": None|"id"|..., "to_lang": "en"|... } }
+# SESSIONS[user_id] = {"from_lang": None|"id"|..., "to_lang": "en"|...}
+SESSIONS = {}
 
 # ===================== Pending consent map ============================
 # PENDING_CONSENTS[unique_id] = { "file_name":..., "download_url":..., "size": int }
@@ -73,6 +65,7 @@ LANG_CHOICES = [
 ]
 
 
+# ===================== Util: mask 'sig' SAS di log ====================
 def _mask_sas(url: str) -> str:
     """Mask parameter 'sig' di URL SAS untuk keamanan log."""
     try:
@@ -93,83 +86,83 @@ class TranslatorBot(TeamsActivityHandler):
 
     # ---------------------- Message Entry ----------------------
     async def on_message_activity(self, turn_context: TurnContext):
-        try:
-            user_id = (turn_context.activity.from_property and turn_context.activity.from_property.id) or "unknown"
-            text   = (turn_context.activity.text or "").strip()
-            value  = turn_context.activity.value or {}
+        user_id = (turn_context.activity.from_property and turn_context.activity.from_property.id) or "unknown"
+        text   = (turn_context.activity.text or "").strip()
+        value  = turn_context.activity.value or {}
 
-            # A) Submit dari Menu/Language Card
-            if isinstance(value, dict):
-                vtype  = value.get("type")
-                action = value.get("action")
-                if vtype == "menu" and action == "translate_document":
-                    await self._send_language_card(turn_context, user_id)
-                    return
-                if vtype == "menu" and action == "how_to_upload":
-                    await self._send_howto(turn_context)
-                    return
-                if vtype == "set_lang":
-                    src = value.get("src_lang")  # "auto" / code
-                    dst = value.get("dst_lang") or "en"
-                    SESSIONS[user_id] = {"from_lang": (None if src in (None, "", "auto") else src), "to_lang": dst}
-                    await turn_context.send_activity(
-                        f"Bahasa diset. Sumber: `{src or 'auto'}`, Tujuan: `{dst}`.\n"
-                        f"• Kirim teks untuk diterjemahkan **atau**\n"
-                        f"• Unggah dokumen (PDF/DOCX/PPTX/XLSX) lalu tekan **Send**."
-                    )
-                    return
-
-            # B) Heartbeat & entry menu
-            if text.lower() in ("ping",):
-                await turn_context.send_activity("pong")
+        # A) Submit dari Menu/Language Card
+        if isinstance(value, dict):
+            vtype  = value.get("type")
+            action = value.get("action")
+            if vtype == "menu" and action == "translate_document":
+                await self._send_language_card(turn_context, user_id)
                 return
-            if text.lower() in ("hi", "halo", "translate", "start", "menu", "help", "/help"):
-                await self._send_menu_card(turn_context)
+            if vtype == "menu" and action == "how_to_upload":
+                await self._send_howto(turn_context)
+                return
+            if vtype == "set_lang":
+                src = value.get("src_lang")  # "auto" / code
+                dst = value.get("dst_lang") or "en"
+                SESSIONS[user_id] = {"from_lang": (None if src in (None, "", "auto") else src), "to_lang": dst}
+                await turn_context.send_activity(
+                    f"Bahasa diset. Sumber: `{src or 'auto'}`, Tujuan: `{dst}`.\n"
+                    f"• Kirim teks untuk diterjemahkan **atau**\n"
+                    f"• Unggah dokumen (PDF/DOCX/PPTX/XLSX) lalu tekan **Send**."
+                )
                 return
 
-            # C) Dokumen
-            if turn_context.activity.attachments:
-                pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
-                try:
-                    await self._handle_attachments(turn_context, to_lang=(pref.get("to_lang") or "en"))
-                except Exception as e:
-                    logging.exception("handle_attachments failed")
-                    await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
-                return
+        # B) Heartbeat & entry menu
+        if text.lower() in ("ping",):
+            await turn_context.send_activity("pong")
+            return
+        if text.lower() in ("hi", "halo", "translate", "start", "menu", "help", "/help"):
+            await self._send_menu_card(turn_context)
+            return
 
-            # D) Teks
-            explicit_from, explicit_to, content = self._parse_direction(text)
+        # C) Dokumen
+        if turn_context.activity.attachments:
             pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
+            try:
+                await self._handle_attachments(turn_context, to_lang=(pref.get("to_lang") or "en"))
+            except Exception as e:
+                logging.exception("handle_attachments failed")
+                await turn_context.send_activity(f"⚠️ Gagal memproses lampiran: {e}")
+            return
 
-            if "->" in (text.split(" ", 1)[0] if text else ""):
-                from_lang, to_lang = explicit_from, explicit_to
-            else:
-                from_lang = pref.get("from_lang")  # None => auto-detect
-                to_lang   = pref.get("to_lang") or "en"
+        # D) Teks
+        explicit_from, explicit_to, content = self._parse_direction(text)
+        pref = SESSIONS.get(user_id, {"to_lang": "en", "from_lang": None})
 
-            if not content:
-                await self._send_menu_card(turn_context)
-                return
+        if "->" in (text.split(" ", 1)[0] if text else ""):
+            from_lang, to_lang = explicit_from, explicit_to
+        else:
+            from_lang = pref.get("from_lang")  # None => auto-detect
+            to_lang   = pref.get("to_lang") or "en"
 
-            if len(content) > MAX_TEXT_LEN:
-                await turn_context.send_activity(f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter.")
-                return
+        if not content:
+            await self._send_menu_card(turn_context)
+            return
 
-            if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
-                await turn_context.send_activity("Translator (text) belum dikonfigurasi di server.")
-                return
+        if len(content) > MAX_TEXT_LEN:
+            await turn_context.send_activity(f"Teks terlalu panjang ({len(content)}). Batas {MAX_TEXT_LEN} karakter.")
+            return
 
-            url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
-            if from_lang:
-                url += f"&from={from_lang}"
+        if not TRANSLATOR_ENDPOINT or not TRANSLATOR_KEY:
+            await turn_context.send_activity("Translator (text) belum dikonfigurasi di server.")
+            return
 
-            headers = {
-                "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
-                "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
-                "Content-type": "application/json",
-                "X-ClientTraceId": str(uuid.uuid4())
-            }
+        url = f"{TRANSLATOR_ENDPOINT}/translate?api-version=3.0&to={to_lang}"
+        if from_lang:
+            url += f"&from={from_lang}"
 
+        headers = {
+            "Ocp-Apim-Subscription-Key": TRANSLATOR_KEY,
+            "Ocp-Apim-Subscription-Region": TRANSLATOR_REGION,  # wajib utk endpoint global
+            "Content-type": "application/json",
+            "X-ClientTraceId": str(uuid.uuid4())
+        }
+
+        try:
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(url, json=[{"Text": content}], headers=headers)
                 if r.status_code >= 400:
@@ -178,10 +171,9 @@ class TranslatorBot(TeamsActivityHandler):
                 data = r.json()
             translated = data[0]["translations"][0]["text"]
             await turn_context.send_activity(translated)
-
         except Exception as e:
-            logging.exception("on_message_activity failed")
-            await turn_context.send_activity(f"Terjadi error saat memproses pesan: {e}")
+            logging.exception("translate-text failed")
+            await turn_context.send_activity(f"Gagal menerjemahkan: {e}")
 
     # ---------- MENU CARD ----------
     async def _send_menu_card(self, turn_context: TurnContext):
@@ -199,9 +191,9 @@ class TranslatorBot(TeamsActivityHandler):
                 {"type": "Action.Submit", "title": "ℹ️ How to upload", "data": {"type": "menu", "action": "how_to_upload"}}
             ]
         }
-        await turn_context.send_activity(Activity(type="message", attachments=[
-            Attachment(content_type="application/vnd.microsoft.card.adaptive", content=card)
-        ]))
+        attachment = Attachment(content_type="application/vnd.microsoft.card.adaptive", content=card)
+        activity   = Activity(type="message", attachments=[attachment])
+        await turn_context.send_activity(activity)
 
     # ---------- HOW TO UPLOAD ----------
     async def _send_howto(self, turn_context: TurnContext):
@@ -239,9 +231,9 @@ class TranslatorBot(TeamsActivityHandler):
                 {"type": "Action.Submit", "title": "Start", "data": {"type": "set_lang"}}
             ]
         }
-        await turn_context.send_activity(Activity(type="message", attachments=[
-            Attachment(content_type="application/vnd.microsoft.card.adaptive", content=card)
-        ]))
+        attachment = Attachment(content_type="application/vnd.microsoft.card.adaptive", content=card)
+        activity   = Activity(type="message", attachments=[attachment])
+        await turn_context.send_activity(activity)
 
     # ---------- Parser arah 'xx->yy kalimat' ----------
     def _parse_direction(self, text: str):
@@ -512,10 +504,11 @@ class TranslatorBot(TeamsActivityHandler):
                 except Exception:
                     pass
 
+        # jalankan background turn
         await adapter.continue_conversation(conversation_reference, _continue_callback, app_id)
 
     # ---------- TEAMS: File Consent (Accept) ----------
-    async def on_teams_file_consent_accept(self, turn_context: TurnContext, file_consent_card_response):
+    async def on_teams_file_consent_accept(self, turn_context: TurnContext, file_consent_card_response: FileConsentCardResponse):
         """
         Saat user klik Allow:
           - SIMPAN info → SEGERA balas 200 (SDK)
@@ -537,6 +530,7 @@ class TranslatorBot(TeamsActivityHandler):
 
             conv_ref = TurnContext.get_conversation_reference(turn_context.activity)
             adapter  = turn_context.adapter
+            # start background upload (invoke akan 200 otomatis setelah handler return)
             await self._bg_upload_to_onedrive(adapter, MICROSOFT_APP_ID, conv_ref, upload_info, pending)
 
         except Exception as e:
@@ -551,9 +545,9 @@ class TranslatorBot(TeamsActivityHandler):
                 pass
 
     # ---------- TEAMS: File Consent (Decline) ----------
-    async def on_teams_file_consent_decline(self, turn_context: TurnContext, file_consent_card_response):
+    async def on_teams_file_consent_decline(self, turn_context: TurnContext, file_consent_card_response: FileConsentCardResponse):
         try:
-            ctx = getattr(file_consent_card_response, "context", None) or {}
+            ctx = file_consent_card_response.context or {}
             unique_id = getattr(ctx, "unique_id", None) or (ctx.get("uniqueId") if isinstance(ctx, dict) else None)
             pending = PENDING_CONSENTS.get(unique_id) if unique_id else None
             if pending:
@@ -567,7 +561,7 @@ class TranslatorBot(TeamsActivityHandler):
                 pass
 
     # ---------- Fallback: tangani invoke fileConsent/invoke & selalu return 200 ----------
-    async def on_teams_invoke_activity(self, turn_context: TurnContext):
+    async def on_teams_invoke_activity(self, turn_context: TurnContext) -> InvokeResponse:
         """
         Sabuk pengaman: bila SDK tidak memanggil on_teams_file_consent_*,
         kita tetap balas 200 agar Teams tidak menampilkan banner merah.
@@ -577,26 +571,22 @@ class TranslatorBot(TeamsActivityHandler):
             if name == "fileconsent/invoke":
                 val = turn_context.activity.value or {}
                 action = (val.get("action") or "").lower()
-                # Bangun objek minimal menyerupai FileConsentCardResponse untuk reuse handler
-                class _FCC: pass
-                fccr = _FCC()
-                setattr(fccr, "upload_info", val.get("uploadInfo") or {})
-                setattr(fccr, "context", val.get("context") or {})
+                # Bungkus value ke FileConsentCardResponse minimal agar helper bisa dipakai ulang
+                try:
+                    fccr = FileConsentCardResponse.from_dict(val)
+                except Exception:
+                    fccr = FileConsentCardResponse()
+                    # minimal isi agar handler tidak null
+                    setattr(fccr, "upload_info", val.get("uploadInfo") or {})
+                    setattr(fccr, "context", val.get("context") or {})
 
                 if action == "accept":
                     await self.on_teams_file_consent_accept(turn_context, fccr)
                 else:
                     await self.on_teams_file_consent_decline(turn_context, fccr)
 
-                if InvokeResponse:  # kalau kelas tersedia, kembalikan 200 formal
-                    return InvokeResponse(status=200, body={})
-                return  # kalau tidak, SDK tetap akan balas 200 default
-            # invoke lain → default
-            if InvokeResponse:
-                return await super().on_teams_invoke_activity(turn_context)
-            return
+                return InvokeResponse(status=200, body={})  # pastikan 200
+            return await super().on_teams_invoke_activity(turn_context)
         except Exception:
             logging.exception("invoke handling failed")
-            if InvokeResponse:
-                return InvokeResponse(status=200, body={})
-            return
+            return InvokeResponse(status=200, body={})  # tetap 200 agar tidak merah
