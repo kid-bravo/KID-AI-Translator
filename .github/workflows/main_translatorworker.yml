@@ -1,0 +1,88 @@
+name: deploy-worker
+on:
+  push:
+    branches: [ main ]
+    paths:
+    - "worker/**"
+    - "webjob/translator-worker/**"
+    - "app/**"
+    - "requirements.txt"
+    - ".github/workflows/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build WebJob package
+      shell: bash
+      run: |
+        set -euo pipefail
+        PKG="pkg"
+        JOB_DIR="$PKG/App_Data/jobs/continuous/translator-worker"
+        mkdir -p "$JOB_DIR"
+
+        # 1) copy WebJob + worker
+        rsync -av --delete --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
+          webjob/translator-worker/ "$JOB_DIR/"
+        rsync -av --delete --exclude '.venv' --exclude '__pycache__' worker "$JOB_DIR/worker"
+
+        # 2) copy app (opsional)
+        if [ -d app ]; then
+          rsync -av --delete --exclude '__pycache__' app "$PKG/app"
+        fi
+
+        # 3) startup.sh (kalau ada di repo)
+        if [ -f run.sh ]; then
+          cp run.sh "$JOB_DIR/run.sh"
+        fi
+        if [ -f startup.sh ]; then
+          cp startup.sh "$PKG/startup.sh"
+          chmod +x "$PKG/startup.sh"
+        fi
+
+        # 4) merge requirements (robust; hindari concat nempel)
+        tmpreq="$(mktemp -t req.XXXXXX 2>/dev/null || mktemp)"
+        trap 'rm -f "$tmpreq"' EXIT
+
+        append_file () {  # sed strip CRLF dan pastikan selalu ada newline di akhir
+          local f="$1"
+          if [ -f "$f" ]; then
+            sed -e 's/\r$//' "$f"
+            echo
+          fi
+        }
+
+        { append_file requirements.txt; append_file requirements-api.txt; } > "$tmpreq"
+
+        # de-dupe case-sensitive, buang baris kosong/komentar
+        awk '
+          BEGIN{IGNORECASE=0}
+          /^[[:space:]]*(#|$)/{next}
+          {sub(/[[:space:]]+$/, "")}
+          !seen[$0]++' "$tmpreq" > "$JOB_DIR/requirements.txt"
+
+        # 5) set PYTHONPATH di run.sh (idempotent)
+        if grep -q '^export PYTHONPATH=' "$JOB_DIR/run.sh"; then
+          sed -i 's|^export PYTHONPATH=.*|export PYTHONPATH="/home/site/wwwroot/.python_packages/lib/site-packages:/home/site/wwwroot:/home/site/wwwroot/app:$PWD:${PYTHONPATH:-}"|' "$JOB_DIR/run.sh"
+        else
+          printf '\nexport PYTHONPATH="/home/site/wwwroot/.python_packages/lib/site-packages:/home/site/wwwroot:/home/site/wwwroot/app:$PWD:${PYTHONPATH:-}"\n' >> "$JOB_DIR/run.sh"
+        fi
+
+        # 6) pastikan LF & executable
+        command -v dos2unix >/dev/null 2>&1 && dos2unix "$JOB_DIR/run.sh" || true
+        chmod +x "$JOB_DIR/run.sh"
+
+        # 7) zip
+        (cd "$PKG" && zip -r ../worker.zip . -x '**/.git/**' '**/__pycache__/**' '**/.venv/**' '*.DS_Store')
+
+        echo "=== PACKAGE TREE ==="
+        (cd "$PKG" && find . -maxdepth 4 -type f | sort)
+
+    - name: Deploy to Azure Web App (worker)
+      uses: azure/webapps-deploy@v3
+      with:
+        app-name: worker-sbcs
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_WORKER }}
+        package: ./worker.zip

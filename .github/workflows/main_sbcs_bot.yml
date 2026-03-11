@@ -1,0 +1,27 @@
+name: deploy-bot
+on:
+  push:
+    branches: [ main ]
+    paths:
+    - "app/**"
+    - "bot/**"
+    - "requirements.txt"
+    - "gunicorn.*.conf.py"
+    - ".github/workflows/deploy-bot.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # Oryx di App Service mencari 'requirements.txt'
+    - name: Prepare requirements for API
+      run: cp requirements-api.txt requirements.txt
+
+    - name: Deploy to Azure Web App (API/Bot)
+      uses: azure/webapps-deploy@v3
+      with:
+        app-name: bot-sbcs-api
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE  }}
+        package: .
