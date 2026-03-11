@@ -1,0 +1,42 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.23/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.23",
+  "version": "2.0.1",
+  "id": "2897cf72-c894-48c1-b069-c896c315ea63",
+
+  "developer": {
+    "name": "SBCS AI TRANSLATOR",
+    "websiteUrl": "https://sbcs.co.id/",
+    "privacyUrl": "https://sbcs.co.id/privacy",
+    "termsOfUseUrl": "https://sbcs.co.id/service"
+  },
+
+  "name": { "short": "SBCS AI TRANSLATOR", "full": "SBCS AI TRANSLATOR for document translation" },
+  "description": {
+    "short": "Translate documents directly in Microsoft Teams.",
+    "full": "AI-powered AI Docs Translation for document translation — upload files (PDF/DOCX/PPTX/XLSX), translate, and save to OneDrive automatically."
+  },
+
+  "accentColor": "#FFFFFF",
+
+  "icons": { "color": "color.png", "outline": "outline.png" },
+
+  "bots": [
+    {
+      "botId": "168dd6ed-75d7-4d1c-aa07-e3d968e01b23",
+      "scopes": ["personal", "team", "groupChat"],
+      "supportsFiles": true,
+      "isNotificationOnly": false
+    }
+  ],
+
+  "permissions": ["messageTeamMembers"],
+
+  "validDomains": [
+    "token.botframework.com",
+    "bot-sbcs-api-hsf7epdrh7ebegg4.indonesiacentral-01.azurewebsites.net"
+  ],
+
+  "defaultInstallScope": "personal",
+  "defaultGroupCapability": { "team": "bot", "groupchat": "bot" }
+}
